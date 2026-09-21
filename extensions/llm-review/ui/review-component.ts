@@ -7,6 +7,7 @@ import type { ReviewState, Severity, Thread } from "../core/threads.ts"
 import {
 	addThread,
 	cycleSeverity,
+	isQuestion,
 	openThreads,
 	removeThread,
 	replyToThread,
@@ -15,13 +16,14 @@ import {
 } from "../core/threads.ts"
 import type { Row } from "./rows.ts"
 import { buildRows, isSelectable, nextHunk, nextSelectable } from "./rows.ts"
+import { debugLog } from "./debug.ts"
 
 export interface ReviewComponentOptions {
 	tui: TUI
 	theme: Theme
 	files: FileDiff[]
 	state: ReviewState
-	onChange: () => void
+	onChange: (deletedId?: string) => void
 	onFix: (threads: Thread[]) => void
 	onClose: () => void
 }
@@ -47,7 +49,7 @@ export class ReviewComponent implements Component, Focusable {
 	private readonly theme: Theme
 	private files: FileDiff[]
 	private readonly state: ReviewState
-	private readonly onChange: () => void
+	private readonly onChange: (deletedId?: string) => void
 	private readonly onFix: (threads: Thread[]) => void
 	private readonly onClose: () => void
 
@@ -104,6 +106,21 @@ export class ReviewComponent implements Component, Focusable {
 		return Math.max(MIN_VIEWPORT, rows - CHROME_ROWS)
 	}
 
+	private logGeometry(width: number, produced: number): void {
+		debugLog("render", {
+			mode: this.tui.mode,
+			termRows: this.tui.terminal.rows,
+			termCols: this.tui.terminal.columns,
+			width,
+			viewport: this.viewportHeight(),
+			produced,
+			rows: this.rows.length,
+			cursor: this.cursor,
+			scrollTop: this.scrollTop,
+			modeUi: this.mode,
+		})
+	}
+
 	private ensureVisible(): void {
 		const height = this.viewportHeight()
 		if (this.cursor < this.scrollTop) this.scrollTop = this.cursor
@@ -131,6 +148,7 @@ export class ReviewComponent implements Component, Focusable {
 	private severityColor(severity: Severity): ThemeColor {
 		if (severity === "critical") return "error"
 		if (severity === "warning") return "warning"
+		if (severity === "question") return "mdLink"
 		return "accent"
 	}
 
@@ -140,8 +158,10 @@ export class ReviewComponent implements Component, Focusable {
 			fixing: ["fixing", "accent"],
 			resolved: ["done", "success"],
 			orphaned: ["moved", "error"],
+			asking: ["asking", "accent"],
+			answered: ["answered", "success"],
 		}
-		const [label, color] = map[thread.status]!
+		const [label, color] = map[thread.status] ?? ["open", "warning"]
 		return this.theme.fg(color, label)
 	}
 
@@ -276,7 +296,7 @@ export class ReviewComponent implements Component, Focusable {
 				removeThread(this.state, thread.id)
 				this.rebuild()
 				this.clampCursor()
-				this.onChange()
+				this.onChange(thread.id)
 			}
 		} else if (data === "f") {
 			const thread = this.currentThread()
@@ -361,11 +381,13 @@ export class ReviewComponent implements Component, Focusable {
 			},
 			{} as Record<string, number>,
 		)
+		const questions = this.state.threads.filter(isQuestion).length
 
 		const title = theme.bold(theme.fg("accent", " llm-review "))
+		const done = (counts.resolved ?? 0) + (counts.answered ?? 0)
 		const summary = theme.fg(
 			"muted",
-			`${this.state.branch} ← ${this.state.baseRef} · ${this.files.length} files · ${counts.open ?? 0} open · ${counts.resolved ?? 0} done`,
+			`${this.state.branch} ← ${this.state.baseRef} · ${this.files.length} files · ${counts.open ?? 0} open · ${questions} question(s) · ${done} done`,
 		)
 		lines.push(truncateToWidth(`${title}${summary}`, width))
 		lines.push(theme.fg("borderMuted", "─".repeat(Math.max(0, width))))
@@ -393,13 +415,15 @@ export class ReviewComponent implements Component, Focusable {
 		if (this.mode === "compose" && this.input) {
 			for (const line of this.input.render(width)) lines.push(line)
 			lines.push(truncateToWidth(theme.fg("dim", " enter submit · esc cancel"), width))
+			this.logGeometry(width, lines.length)
 			return lines
 		}
 
 		const help =
-			" j/k move · n/p hunk · space fold · c comment · r reply · s sev · x done · d del · f fix · F fix all · q quit"
+			" j/k move · n/p hunk · space fold · c comment · r reply · s sev/question · x done · d del · f send · F send all · q quit"
 		lines.push(truncateToWidth(theme.fg("dim", help), width))
 		if (this.notice) lines.push(truncateToWidth(theme.fg("warning", ` ${this.notice}`), width))
+		this.logGeometry(width, lines.length)
 		return lines
 	}
 

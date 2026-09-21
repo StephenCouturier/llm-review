@@ -6,11 +6,17 @@ export interface ExecResultLike {
 
 export type Exec = (command: string, args: string[]) => Promise<ExecResultLike>
 
-export interface RepoInfo {
+export type ReviewScope = "branch" | "local"
+
+export interface RepoBasics {
 	root: string
 	branch: string
+}
+
+export interface RepoInfo extends RepoBasics {
 	baseRef: string
-	mergeBase: string
+	diffBase: string
+	scope: ReviewScope
 }
 
 export interface ChangedFile {
@@ -53,12 +59,25 @@ export async function detectBaseRef(exec: Exec, override?: string): Promise<stri
 	return null
 }
 
-export async function getRepoInfo(exec: Exec, baseOverride?: string): Promise<RepoInfo> {
+export async function getRepoBasics(exec: Exec): Promise<RepoBasics> {
 	const root = await run(exec, ["rev-parse", "--show-toplevel"])
 	if (!root) throw new Error("not inside a git repository")
-
 	const branch = (await run(exec, ["rev-parse", "--abbrev-ref", "HEAD"])) ?? "HEAD"
+	return { root, branch }
+}
 
+export async function getRepoInfo(
+	exec: Exec,
+	options: { scope?: ReviewScope; baseOverride?: string } = {},
+): Promise<RepoInfo> {
+	const scope = options.scope ?? "branch"
+	const { root, branch } = await getRepoBasics(exec)
+
+	if (scope === "local") {
+		return { root, branch, baseRef: "HEAD", diffBase: "HEAD", scope }
+	}
+
+	const baseOverride = options.baseOverride
 	const baseRef = await detectBaseRef(exec, baseOverride)
 	if (!baseRef) {
 		throw new Error(
@@ -71,7 +90,7 @@ export async function getRepoInfo(exec: Exec, baseOverride?: string): Promise<Re
 	const mergeBase = await run(exec, ["merge-base", baseRef, "HEAD"])
 	if (!mergeBase) throw new Error(`no merge base between ${baseRef} and HEAD`)
 
-	return { root, branch, baseRef, mergeBase }
+	return { root, branch, baseRef, diffBase: mergeBase, scope }
 }
 
 function parseStatusChar(raw: string): ChangedFile["status"] {
@@ -82,10 +101,10 @@ function parseStatusChar(raw: string): ChangedFile["status"] {
 	return "modified"
 }
 
-export async function listChangedFiles(exec: Exec, mergeBase: string): Promise<ChangedFile[]> {
+export async function listChangedFiles(exec: Exec, diffBase: string): Promise<ChangedFile[]> {
 	const files: ChangedFile[] = []
 
-	const tracked = await run(exec, ["diff", "--name-status", "-M", mergeBase])
+	const tracked = await run(exec, ["diff", "--name-status", "-M", diffBase])
 	if (tracked) {
 		for (const line of tracked.split("\n")) {
 			if (!line.trim()) continue
@@ -114,7 +133,7 @@ export async function listChangedFiles(exec: Exec, mergeBase: string): Promise<C
 
 export async function getFileDiff(
 	exec: Exec,
-	mergeBase: string,
+	diffBase: string,
 	file: ChangedFile,
 	contextLines = 5,
 ): Promise<string> {
@@ -134,7 +153,7 @@ export async function getFileDiff(
 		"diff",
 		"-M",
 		`-U${contextLines}`,
-		mergeBase,
+		diffBase,
 		"--",
 		...(file.oldPath ? [file.oldPath, file.path] : [file.path]),
 	])

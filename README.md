@@ -20,10 +20,13 @@ pi -e git:github.com/StephenCouturier/llm-review
 
 ```
 /llm-review              review the branch against its auto-detected base
+/llm-review --local      review only uncommitted changes (staged, unstaged, untracked)
 /llm-review origin/dev   review against an explicit base ref
 ```
 
-The diff covers everything on the branch: commits since the merge base, plus staged, unstaged, and untracked files.
+By default the diff covers everything on the branch: commits since the merge base, plus staged, unstaged, and untracked files. With `--local` (or `-l`) it covers only what you haven't committed yet, diffed against `HEAD`.
+
+Comments live in the same per-branch file regardless of scope, so a comment left in `--local` is still there when you open the full branch review.
 
 ### Keys
 
@@ -36,12 +39,20 @@ The diff covers everything on the branch: commits since the merge base, plus sta
 | `space` | Fold / unfold the current file |
 | `c` | Comment on the current line |
 | `r` | Reply to the comment thread under the cursor |
-| `s` | Cycle severity (critical → warning → suggestion) |
+| `s` | Cycle severity (critical → warning → suggestion → question) |
 | `x` | Toggle resolved |
 | `d` | Delete the thread |
 | `f` | Send the thread under the cursor to the agent |
 | `F` | Send all open threads to the agent |
 | `q` / `esc` | Close |
+
+## Questions vs. fixes
+
+Cycle a thread's severity to `question` with `s` and it becomes a question instead of a change request.
+
+On dispatch the prompt is split into two sections: **Fix these** (change the code) and **Answer these** ("these are questions, not change requests — do NOT modify any files"). Question threads move `open → asking → answered`; fix threads move `open → fixing → resolved`.
+
+The agent is asked to reply with one numbered section per comment, and each section is routed back to the thread it belongs to, so every comment gets its own answer rather than a copy of the whole response.
 
 ## How it works
 
@@ -61,6 +72,10 @@ Reviews persist per repo and branch at:
 
 Nothing is written into the repository you're reviewing.
 
+Saves merge against what is already on disk, keyed by thread id, so two pi sessions reviewing the same branch cannot clobber each other's comments. A thread is only removed when you explicitly delete it with `d`.
+
+Set `LLM_REVIEW_DEBUG=1` to append render/geometry diagnostics to `/tmp/llm-review-debug.log` (override with `LLM_REVIEW_DEBUG_FILE`).
+
 ## Requirements
 
 - pi >= 0.85
@@ -71,6 +86,7 @@ Nothing is written into the repository you're reviewing.
 - Comments are single-line input; use `r` to add detail across multiple replies.
 - No intra-line (word-level) diff highlighting, just line-level colors.
 - Very large diffs are not capped and may be slow to open.
+- Threads are re-anchored by matching their source line; if the agent rewrites a line beyond recognition the thread is flagged `moved` rather than relocated.
 
 ## License
 
