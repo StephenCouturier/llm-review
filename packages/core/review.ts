@@ -1,5 +1,6 @@
 import type { ReviewBatch } from "./batch.ts"
 import { createBatch, findBatchForThread, listBatches, loadBatch, recordResult, saveBatch } from "./batch.ts"
+import { loadConfig, loadTemplates } from "./config.ts"
 import type { FileDiff } from "./diff.ts"
 import { parseUnifiedDiff } from "./diff.ts"
 import type { Exec, RepoBasics, ReviewScope } from "./git.ts"
@@ -80,8 +81,12 @@ export async function dispatchThreads(
 	for (const thread of threads) setStatus(thread, dispatchStatus(thread))
 	await saveState(loaded.file, loaded.state, options.deleted)
 
+	const config = loadConfig()
 	const prompt = buildDispatchPrompt(threads, loaded.state.baseRef, {
 		replyVia: options.replyVia,
+		templates: loadTemplates(),
+		context: config.context,
+		branch: loaded.state.branch,
 		files: loaded.files ? new Map(loaded.files.map((file) => [file.path, file])) : undefined,
 	})
 	const head = await exec("git", ["rev-parse", "HEAD"])

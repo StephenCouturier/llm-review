@@ -158,7 +158,7 @@ async function main(argv: string[]): Promise<void> {
 			}
 			for (const thread of threads) {
 				const comment = thread.messages.find((message) => message.role === "user")?.text ?? ""
-				process.stdout.write(`${thread.id}  ${thread.severity.padEnd(10)} ${threadLocation(thread)}  ${comment}\n`)
+				process.stdout.write(`${thread.id}  ${thread.kind.padEnd(9)} ${threadLocation(thread)}  ${comment}\n`)
 			}
 			return
 		}

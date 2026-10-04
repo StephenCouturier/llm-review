@@ -4,7 +4,7 @@ import { dirname, join } from "node:path"
 import type { FileDiff } from "./diff.ts"
 import { findLineText } from "./diff.ts"
 import type { ReviewState, Thread } from "./threads.ts"
-import { createState } from "./threads.ts"
+import { createState, migrateThread } from "./threads.ts"
 
 function slugify(value: string): string {
 	return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unnamed"
@@ -57,12 +57,13 @@ export async function loadState(
 		return createState(repoRoot, branch, baseRef ?? "HEAD")
 	}
 	if (baseRef) parsed.baseRef = baseRef
+	parsed.threads.forEach(migrateThread)
 	return parsed
 }
 
 async function readThreadsOnDisk(file: string): Promise<Thread[]> {
 	const parsed = await readJson<ReviewState>(file)
-	return parsed && Array.isArray(parsed.threads) ? parsed.threads : []
+	return parsed && Array.isArray(parsed.threads) ? parsed.threads.map(migrateThread) : []
 }
 
 export async function saveState(

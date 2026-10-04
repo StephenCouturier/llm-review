@@ -1,19 +1,26 @@
 import { TuiMainScreen } from "@earendil-works/pi-tui"
+import { loadConfig, loadUiPrefs, saveUiPrefs } from "../core/config.ts"
 import type { LoadedReview } from "../core/review.ts"
 import { saveState } from "../core/store.ts"
 import type { Thread } from "../core/threads.ts"
+import { resolveKeys } from "./keys.ts"
 import { ReviewComponent } from "./review-component.ts"
-import { ansiTheme } from "./theme.ts"
+import { loadTheme } from "./theme.ts"
 import { TtyTerminal } from "./tty-terminal.ts"
 
 export interface TuiResult {
-	/** Threads picked with f/F, or empty when the user quit without sending. */
+	/** Open threads when the user sent, or empty when they quit without sending. */
 	threads: Thread[]
 	deleted: Set<string>
 }
 
 /** Run the review UI full-screen on /dev/tty until the user sends or quits. */
 export function runReviewTui(loaded: LoadedReview, options: { sendLabel?: string } = {}): Promise<TuiResult> {
+	// Resolve config before touching the terminal so mistakes print as normal errors.
+	const config = loadConfig()
+	const keys = resolveKeys(config.keys)
+	const theme = loadTheme(config.theme)
+
 	const terminal = new TtyTerminal()
 	const tui = new TuiMainScreen(terminal)
 	const deleted = new Set<string>()
@@ -30,16 +37,19 @@ export function runReviewTui(loaded: LoadedReview, options: { sendLabel?: string
 
 		const component = new ReviewComponent({
 			tui,
-			theme: ansiTheme,
+			theme,
+			keys,
 			files: loaded.files,
 			state: loaded.state,
 			sendLabel: options.sendLabel,
 			chromeRows: 5,
+			prefs: loadUiPrefs(),
+			onPrefsChange: (prefs) => void saveUiPrefs(prefs),
 			onChange: (deletedId) => {
 				if (deletedId) deleted.add(deletedId)
 				void saveState(loaded.file, loaded.state, deleted)
 			},
-			onFix: (threads) => finish(threads),
+			onSend: (threads) => finish(threads),
 			onClose: () => finish([]),
 		})
 

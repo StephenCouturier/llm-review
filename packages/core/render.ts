@@ -1,7 +1,9 @@
 import type { ReviewBatch } from "./batch.ts"
+import type { Templates } from "./config.ts"
+import { fillTemplate } from "./config.ts"
 import type { DiffLine, FileDiff } from "./diff.ts"
 import type { Thread } from "./threads.ts"
-import { isQuestion, REPLY_STATUSES, SEVERITY_LABEL, SEVERITY_ORDER, threadEnd, threadLocation } from "./threads.ts"
+import { isQuestion, REPLY_STATUSES, threadEnd, threadLocation } from "./threads.ts"
 
 /**
  * How the agent should report back per thread.
@@ -17,7 +19,20 @@ export interface RenderOptions {
 	files?: Map<string, FileDiff>
 	/** Diff lines of context shown around the commented lines. */
 	context?: number
+	/** User overrides for the opening line and closing guidelines (see config.ts). */
+	templates?: Templates
+	branch?: string
 }
+
+const DEFAULT_HEADER = "I reviewed the current branch (diffed against `{base}`) and left {count} comment(s)."
+
+const DEFAULT_FOOTER = [
+	"Guidelines:",
+	"- Fix items: change the code directly, do not just describe the fix.",
+	"- Question items: answer only. Do not edit files to answer a question.",
+	"- If a comment is wrong or you disagree, say so instead of making the change.",
+	"- Keep changes scoped to the comment; do not refactor unrelated code.",
+].join("\n")
 
 const DEFAULT_CONTEXT = 3
 
@@ -70,7 +85,7 @@ function formatThread(thread: Thread, options: RenderOptions): string {
 	const firstIndex = thread.messages.findIndex((message) => message.role === "user")
 	const first = firstIndex >= 0 ? thread.messages[firstIndex] : undefined
 	const side = thread.side === "old" && thread.line > 0 ? " (removed lines, old numbering)" : ""
-	lines.push(`**${SEVERITY_LABEL[thread.severity]}** \`${threadLocation(thread)}\`${side} (thread \`${thread.id}\`)`)
+	lines.push(`\`${threadLocation(thread)}\`${side} (thread \`${thread.id}\`)`)
 	const file = options.files?.get(thread.path)
 	const snippet = file ? diffSnippet(thread, file, options.context) : undefined
 	if (snippet) {
@@ -94,14 +109,12 @@ function formatThread(thread: Thread, options: RenderOptions): string {
 
 export function sortThreads(threads: Thread[]): Thread[] {
 	return [...threads].sort((a, b) => {
-		const bySeverity = SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity)
-		if (bySeverity !== 0) return bySeverity
 		if (a.path !== b.path) return a.path.localeCompare(b.path)
 		return a.line - b.line
 	})
 }
 
-/** Fixes first, then questions, each sorted by severity/path/line. This is the numbering the agent sees. */
+/** Fixes first, then questions, each sorted by path/line. This is the numbering the agent sees. */
 export function dispatchOrder(threads: Thread[]): Thread[] {
 	return [
 		...sortThreads(threads.filter((thread) => !isQuestion(thread))),
@@ -154,8 +167,14 @@ export function buildDispatchPrompt(
 	const fixes = order.filter((thread) => !isQuestion(thread))
 	const questions = order.filter((thread) => isQuestion(thread))
 
-	const total = order.length
-	const header = `I reviewed the current branch (diffed against \`${baseRef}\`) and left ${total} comment${total === 1 ? "" : "s"}.`
+	const values = {
+		count: order.length,
+		fixes: fixes.length,
+		questions: questions.length,
+		base: baseRef,
+		branch: options.branch ?? "",
+	}
+	const header = fillTemplate(options.templates?.header ?? DEFAULT_HEADER, values)
 
 	const sections: string[] = []
 	let counter = 0
@@ -182,14 +201,11 @@ export function buildDispatchPrompt(
 		)
 	}
 
+	// The reply instructions are not templated: the round trip depends on them.
 	const footer = [
 		...respondFooter(replyVia),
 		"",
-		"Guidelines:",
-		"- Fix items: change the code directly, do not just describe the fix.",
-		"- Question items: answer only. Do not edit files to answer a question.",
-		"- If a comment is wrong or you disagree, say so instead of making the change.",
-		"- Keep changes scoped to the comment; do not refactor unrelated code.",
+		fillTemplate(options.templates?.footer ?? DEFAULT_FOOTER, values),
 	].join("\n")
 
 	return {

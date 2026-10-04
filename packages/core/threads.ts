@@ -1,6 +1,8 @@
-export type Severity = "critical" | "warning" | "suggestion" | "question"
-
+/** A comment either asks for a change or asks a question. */
 export type ThreadKind = "fix" | "question"
+
+/** Pre-0.3 severities; only read when migrating old state files. */
+type LegacySeverity = "critical" | "warning" | "suggestion" | "question"
 
 export type ThreadStatus =
 	| "open"
@@ -31,8 +33,9 @@ export interface Thread {
 	endLine?: number
 	side: "new" | "old"
 	anchorText: string
-	severity: Severity
 	kind: ThreadKind
+	/** @deprecated legacy field from state files written before comment types replaced severities */
+	severity?: LegacySeverity
 	status: ThreadStatus
 	messages: ThreadMessage[]
 	createdAt: number
@@ -45,23 +48,26 @@ export interface ReviewState {
 	branch: string
 	baseRef: string
 	threads: Thread[]
+	/** Files marked viewed, keyed by path, with the diff hash they were viewed at. */
+	viewed?: Record<string, string>
 }
 
-export const SEVERITY_ORDER: Severity[] = ["critical", "warning", "suggestion", "question"]
-
-export const SEVERITY_LABEL: Record<Severity, string> = {
-	critical: "CRITICAL",
-	warning: "WARNING",
-	suggestion: "SUGGESTION",
+export const KIND_LABEL: Record<ThreadKind, string> = {
+	fix: "FIX",
 	question: "QUESTION",
 }
 
-export function kindForSeverity(severity: Severity): ThreadKind {
-	return severity === "question" ? "question" : "fix"
+export function isQuestion(thread: Thread): boolean {
+	return thread.kind === "question"
 }
 
-export function isQuestion(thread: Thread): boolean {
-	return (thread.kind ?? kindForSeverity(thread.severity)) === "question"
+/** Bring threads from older state files up to the current shape. */
+export function migrateThread(thread: Thread): Thread {
+	if (thread.kind !== "fix" && thread.kind !== "question") {
+		thread.kind = thread.severity === "question" ? "question" : "fix"
+	}
+	delete thread.severity
+	return thread
 }
 
 export function createState(repo: string, branch: string, baseRef: string): ReviewState {
@@ -80,7 +86,7 @@ export function addThread(
 		endLine?: number
 		side: "new" | "old"
 		anchorText: string
-		severity: Severity
+		kind: ThreadKind
 		text: string
 	},
 ): Thread {
@@ -92,8 +98,7 @@ export function addThread(
 		...(input.endLine !== undefined && input.endLine > input.line ? { endLine: input.endLine } : {}),
 		side: input.side,
 		anchorText: input.anchorText,
-		severity: input.severity,
-		kind: kindForSeverity(input.severity),
+		kind: input.kind,
 		status: "open",
 		messages: [{ role: "user", text: input.text, ts: now }],
 		createdAt: now,
@@ -126,10 +131,9 @@ export function setStatus(thread: Thread, status: ThreadStatus): void {
 	thread.updatedAt = Date.now()
 }
 
-export function cycleSeverity(thread: Thread): void {
-	const index = SEVERITY_ORDER.indexOf(thread.severity)
-	thread.severity = SEVERITY_ORDER[(index + 1) % SEVERITY_ORDER.length]!
-	thread.kind = kindForSeverity(thread.severity)
+export function toggleKind(thread: Thread): void {
+	thread.kind = thread.kind === "question" ? "fix" : "question"
+	if (thread.status === "answered" || thread.status === "resolved") thread.status = "open"
 	thread.updatedAt = Date.now()
 }
 

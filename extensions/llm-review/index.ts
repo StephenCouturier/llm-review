@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-agent"
+import { loadConfig, loadUiPrefs, saveUiPrefs } from "../../packages/core/config.ts"
 import type { Exec, ReviewScope } from "../../packages/core/git.ts"
 import type { LoadedReview } from "../../packages/core/review.ts"
 import { dispatchThreads, loadReview, settleBatch } from "../../packages/core/review.ts"
@@ -7,6 +8,7 @@ import { saveState } from "../../packages/core/store.ts"
 import type { Thread } from "../../packages/core/threads.ts"
 import { isQuestion } from "../../packages/core/threads.ts"
 import { debugLog } from "../../packages/tui/debug.ts"
+import { resolveKeys } from "../../packages/tui/keys.ts"
 import { ReviewComponent } from "../../packages/tui/review-component.ts"
 
 interface ParsedArgs {
@@ -135,11 +137,14 @@ export default function (pi: ExtensionAPI) {
 						theme,
 						files: loaded.files,
 						state: loaded.state,
+						keys: resolveKeys(loadConfig().keys),
+						prefs: loadUiPrefs(),
+						onPrefsChange: (prefs) => void saveUiPrefs(prefs),
 						onChange: (deletedId) => {
 							if (deletedId) deleted.add(deletedId)
 							void saveState(loaded.file, loaded.state, deleted)
 						},
-						onFix: (threads) => {
+						onSend: (threads) => {
 							dispatch.threads = threads
 							done()
 						},
@@ -175,7 +180,7 @@ export default function (pi: ExtensionAPI) {
 					id: thread.id,
 					path: thread.path,
 					line: thread.line,
-					severity: thread.severity,
+					kind: thread.kind,
 				})),
 			})
 

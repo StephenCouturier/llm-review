@@ -1,23 +1,25 @@
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui"
-import { Input, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui"
-import type { FileDiff } from "../core/diff.ts"
-import { anchorLine } from "../core/diff.ts"
-import type { ReviewState, Severity, Thread } from "../core/threads.ts"
+import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui"
+import type { UiPrefs } from "../core/config.ts"
+import type { DiffLine, FileDiff } from "../core/diff.ts"
+import { anchorLine, fileDiffHash } from "../core/diff.ts"
+import type { ReviewState, Thread, ThreadKind } from "../core/threads.ts"
 import {
 	addThread,
-	cycleSeverity,
 	isQuestion,
+	KIND_LABEL,
 	openThreads,
 	removeThread,
 	replyToThread,
-	SEVERITY_LABEL,
 	setStatus,
 	threadLocation,
+	toggleKind,
 } from "../core/threads.ts"
+import type { Action, KeyMap } from "./keys.ts"
+import { actionFor, keyLabel, matchesBinding, resolveKeys } from "./keys.ts"
+import type { LineRow, Row } from "./rows.ts"
+import { buildRows, isLineRow, isSelectable, nextHunk, nextSelectable } from "./rows.ts"
 import type { ReviewTheme, ThemeColor } from "./theme.ts"
-import type { Row } from "./rows.ts"
-import { buildRows, isSelectable, nextHunk, nextSelectable } from "./rows.ts"
-import { debugLog } from "./debug.ts"
 
 export interface ReviewComponentOptions {
 	tui: TUI
@@ -25,18 +27,25 @@ export interface ReviewComponentOptions {
 	files: FileDiff[]
 	state: ReviewState
 	onChange: (deletedId?: string) => void
-	onFix: (threads: Thread[]) => void
+	/** Called with every open thread when the user sends. */
+	onSend: (threads: Thread[]) => void
 	onClose: () => void
-	/** Help-bar label for f/F, e.g. "send" inside an agent, "emit" for the standalone CLI. */
+	/** Help-bar label for the send key, e.g. "send" inside an agent, "emit" for the standalone CLI. */
 	sendLabel?: string
 	/** Rows reserved for header/footer; the overlay inside pi needs more than a full-screen app. */
 	chromeRows?: number
+	keys?: KeyMap
+	prefs?: UiPrefs
+	onPrefsChange?: (prefs: UiPrefs) => void
 }
 
 type Mode = "browse" | "compose"
+type Column = "left" | "right"
 
 const MIN_VIEWPORT = 8
 const CHROME_ROWS = 10
+/** Below this width split view falls back to unified. */
+const MIN_SPLIT_WIDTH = 100
 
 export class ReviewComponent implements Component, Focusable {
 	private isFocused = false
@@ -55,22 +64,31 @@ export class ReviewComponent implements Component, Focusable {
 	private files: FileDiff[]
 	private readonly state: ReviewState
 	private readonly onChange: (deletedId?: string) => void
-	private readonly onFix: (threads: Thread[]) => void
+	private readonly onSend: (threads: Thread[]) => void
 	private readonly onClose: () => void
+	private readonly onPrefsChange?: (prefs: UiPrefs) => void
 	private readonly sendLabel: string
 	private readonly chromeRows: number
+	private readonly keys: KeyMap
 
-	private collapsed = new Set<string>()
 	private rows: Row[] = []
 	private cursor = 0
 	private scrollTop = 0
 	private mode: Mode = "browse"
 	private input: Input | null = null
-	private composeKind: "comment" | "reply" = "comment"
 	private composeThread: Thread | null = null
+	private composeKind: ThreadKind = "fix"
 	private notice = ""
-	/** Row index where a range selection started (`v`), or null. */
+	/** Row index where a range selection started, or null. */
 	private mark: number | null = null
+
+	private split: boolean
+	private lineNumbers: boolean
+	/** Split view only: which side comments attach to on rows that have both. */
+	private column: Column = "right"
+	/** Whether rows are currently built split (split preference AND wide enough). */
+	private builtSplit = false
+	private width = 0
 
 	constructor(options: ReviewComponentOptions) {
 		this.tui = options.tui
@@ -78,14 +96,16 @@ export class ReviewComponent implements Component, Focusable {
 		this.files = options.files
 		this.state = options.state
 		this.onChange = options.onChange
-		this.onFix = options.onFix
+		this.onSend = options.onSend
 		this.onClose = options.onClose
+		this.onPrefsChange = options.onPrefsChange
 		this.sendLabel = options.sendLabel ?? "send"
 		this.chromeRows = options.chromeRows ?? CHROME_ROWS
+		this.keys = options.keys ?? resolveKeys()
+		this.split = options.prefs?.split ?? false
+		this.lineNumbers = options.prefs?.lineNumbers ?? true
 		this.rebuild()
-		this.cursor = isSelectable(this.rows[0] ?? { kind: "spacer" })
-			? 0
-			: nextSelectable(this.rows, 0, 1)
+		this.cursor = isSelectable(this.rows[0] ?? { kind: "spacer" }) ? 0 : nextSelectable(this.rows, 0, 1)
 	}
 
 	setFiles(files: FileDiff[]): void {
@@ -100,8 +120,29 @@ export class ReviewComponent implements Component, Focusable {
 		this.tui.requestRender()
 	}
 
+	// ── rows & cursor ───────────────────────────────────────────────
+
+	private wantsSplit(): boolean {
+		return this.split && (this.width === 0 || this.width >= MIN_SPLIT_WIDTH)
+	}
+
 	private rebuild(): void {
-		this.rows = buildRows(this.files, this.state, this.collapsed)
+		this.builtSplit = this.wantsSplit()
+		this.rows = buildRows(this.files, this.state, { split: this.builtSplit })
+	}
+
+	/** Rebuild keeping the cursor on the same diff line / file where possible. */
+	private rebuildKeepingPlace(): void {
+		const row = this.currentRow()
+		const line = row ? this.lineFor(row) : undefined
+		const path = row && row.kind !== "spacer" ? row.path : undefined
+		this.mark = null
+		this.rebuild()
+		let index = -1
+		if (line) index = this.rows.findIndex((entry) => isLineRow(entry) && (entry.kind === "line" ? entry.line === line : entry.left === line || entry.right === line))
+		if (index < 0 && path) index = this.rows.findIndex((entry) => entry.kind === "file" && entry.path === path)
+		if (index >= 0) this.cursor = index
+		this.clampCursor()
 	}
 
 	private clampCursor(): void {
@@ -117,21 +158,6 @@ export class ReviewComponent implements Component, Focusable {
 		return Math.max(MIN_VIEWPORT, rows - this.chromeRows)
 	}
 
-	private logGeometry(width: number, produced: number): void {
-		debugLog("render", {
-			mode: this.tui.mode,
-			termRows: this.tui.terminal.rows,
-			termCols: this.tui.terminal.columns,
-			width,
-			viewport: this.viewportHeight(),
-			produced,
-			rows: this.rows.length,
-			cursor: this.cursor,
-			scrollTop: this.scrollTop,
-			modeUi: this.mode,
-		})
-	}
-
 	private ensureVisible(): void {
 		const height = this.viewportHeight()
 		if (this.cursor < this.scrollTop) this.scrollTop = this.cursor
@@ -145,22 +171,278 @@ export class ReviewComponent implements Component, Focusable {
 		return this.rows[this.cursor]
 	}
 
-	private currentFilePath(): string | undefined {
-		const row = this.currentRow()
-		if (!row || row.kind === "spacer") return undefined
-		return row.path
-	}
-
 	private currentThread(): Thread | undefined {
 		const row = this.currentRow()
 		return row?.kind === "thread" ? row.thread : undefined
 	}
 
-	private severityColor(severity: Severity): ThemeColor {
-		if (severity === "critical") return "error"
-		if (severity === "warning") return "warning"
-		if (severity === "question") return "mdLink"
-		return "accent"
+	/** The diff line a row anchors to, honouring the active column in split view. */
+	private lineFor(row: Row): DiffLine | undefined {
+		if (row.kind === "line") return row.line
+		if (row.kind !== "pair") return undefined
+		return this.column === "left" ? (row.left ?? row.right) : (row.right ?? row.left)
+	}
+
+	// ── range selection ─────────────────────────────────────────────
+
+	private markedRows(): LineRow[] {
+		if (this.mark === null) return []
+		const from = Math.min(this.mark, this.cursor)
+		const to = Math.max(this.mark, this.cursor)
+		return this.rows.slice(from, to + 1).filter(isLineRow)
+	}
+
+	private inMarkedRange(index: number): boolean {
+		if (this.mark === null) return false
+		return index >= Math.min(this.mark, this.cursor) && index <= Math.max(this.mark, this.cursor)
+	}
+
+	/**
+	 * The range selection as a thread anchor. Ranges are numbered on the new side when
+	 * any selected line exists there; removed lines inside such a range are just context.
+	 */
+	private selectedRange():
+		| { path: string; line: number; endLine: number; side: "new" | "old"; anchorText: string }
+		| undefined {
+		const rows = this.markedRows()
+		const path = rows[0]?.path
+		if (!path || rows.some((row) => row.path !== path)) return undefined
+		const lines = rows.map((row) => this.lineFor(row)).filter((line): line is DiffLine => line !== undefined)
+		if (lines.length < 2) return undefined
+		const onNew = lines.filter((line) => line.newNo !== null)
+		const side: "new" | "old" = onNew.length > 0 ? "new" : "old"
+		const anchored = side === "new" ? onNew : lines
+		const numberOf = (line: DiffLine) => (side === "new" ? line.newNo : line.oldNo) ?? 0
+		return {
+			path,
+			line: numberOf(anchored[0]!),
+			endLine: numberOf(anchored[anchored.length - 1]!),
+			side,
+			anchorText: anchored[0]!.text,
+		}
+	}
+
+	// ── compose ─────────────────────────────────────────────────────
+
+	private startCompose(thread: Thread | null): void {
+		this.composeThread = thread
+		this.composeKind = thread?.kind ?? "fix"
+		this.mode = "compose"
+		const input = new Input()
+		input.focused = this.isFocused
+		input.onSubmit = (value) => this.submitCompose(value)
+		input.onEscape = () => this.cancelCompose()
+		this.input = input
+	}
+
+	private cancelCompose(): void {
+		this.mode = "browse"
+		this.input = null
+		this.composeThread = null
+		this.tui.requestRender()
+	}
+
+	private submitCompose(value: string): void {
+		const text = value.trim()
+		if (!text) {
+			this.cancelCompose()
+			return
+		}
+
+		const reply = this.composeThread
+		if (reply) {
+			if (reply.kind !== this.composeKind) toggleKind(reply)
+			replyToThread(reply, "user", text)
+		} else {
+			const row = this.currentRow()
+			const range = this.selectedRange()
+			const line = row ? this.lineFor(row) : undefined
+			const single = this.markedRows()
+			const only = single.length === 1 ? this.lineFor(single[0]!) : undefined
+			if (range) {
+				addThread(this.state, { ...range, kind: this.composeKind, text })
+			} else if ((line || only) && row && row.kind !== "spacer") {
+				const target = (only ?? line)!
+				const anchor = anchorLine(target)
+				addThread(this.state, {
+					path: single[0]?.path ?? row.path,
+					line: anchor.line,
+					side: anchor.side,
+					anchorText: target.text,
+					kind: this.composeKind,
+					text,
+				})
+			} else if (row?.kind === "file") {
+				addThread(this.state, { path: row.path, line: 0, side: "new", anchorText: "", kind: this.composeKind, text })
+			}
+		}
+
+		this.mode = "browse"
+		this.input = null
+		this.composeThread = null
+		this.mark = null
+		this.rebuild()
+		this.clampCursor()
+		this.onChange()
+		this.tui.requestRender()
+	}
+
+	// ── input ───────────────────────────────────────────────────────
+
+	handleInput(data: string): void {
+		if (this.mode === "compose") {
+			if (this.keys.toggleType.some((binding) => matchesBinding(data, binding))) {
+				this.composeKind = this.composeKind === "fix" ? "question" : "fix"
+			} else {
+				this.input?.handleInput(data)
+			}
+			this.tui.requestRender()
+			return
+		}
+
+		this.notice = ""
+		const action = actionFor(this.keys, data)
+
+		if (action === "quit" && this.mark !== null && !matchesBinding(data, "q")) {
+			this.mark = null
+			this.tui.requestRender()
+			return
+		}
+		if (action === "quit") {
+			this.onClose()
+			return
+		}
+		if (action) this.perform(action)
+
+		this.ensureVisible()
+		this.tui.requestRender()
+	}
+
+	private persistPrefs(): void {
+		this.onPrefsChange?.({ split: this.split, lineNumbers: this.lineNumbers })
+	}
+
+	private perform(action: Exclude<Action, "quit">): void {
+		switch (action) {
+			case "down":
+				this.cursor = nextSelectable(this.rows, this.cursor, 1)
+				return
+			case "up":
+				this.cursor = nextSelectable(this.rows, this.cursor, -1)
+				return
+			case "left":
+				this.column = "left"
+				return
+			case "right":
+				this.column = "right"
+				return
+			case "nextHunk":
+				this.cursor = nextHunk(this.rows, this.cursor, 1)
+				return
+			case "prevHunk":
+				this.cursor = nextHunk(this.rows, this.cursor, -1)
+				return
+			case "top":
+				this.cursor = isSelectable(this.rows[0] ?? { kind: "spacer" }) ? 0 : nextSelectable(this.rows, 0, 1)
+				return
+			case "bottom":
+				this.cursor = nextSelectable(this.rows, this.rows.length, -1)
+				return
+			case "pageDown":
+			case "pageUp": {
+				const direction = action === "pageDown" ? 1 : -1
+				for (let i = 0; i < this.viewportHeight(); i++) this.cursor = nextSelectable(this.rows, this.cursor, direction)
+				return
+			}
+			case "viewed": {
+				const row = this.currentRow()
+				if (!row || row.kind === "spacer") return
+				const file = this.files.find((entry) => entry.path === row.path)
+				if (!file) return
+				const viewed = (this.state.viewed ??= {})
+				const hash = fileDiffHash(file)
+				if (viewed[file.path] === hash) delete viewed[file.path]
+				else viewed[file.path] = hash
+				this.mark = null
+				this.rebuild()
+				const index = this.rows.findIndex((entry) => entry.kind === "file" && entry.path === file.path)
+				if (index >= 0) this.cursor = index
+				this.clampCursor()
+				this.onChange()
+				return
+			}
+			case "range": {
+				const row = this.currentRow()
+				if (this.mark !== null) this.mark = null
+				else if (row && isLineRow(row)) this.mark = this.cursor
+				else this.notice = "start a range on a diff line"
+				return
+			}
+			case "comment": {
+				const row = this.currentRow()
+				if (this.mark !== null) {
+					const rows = this.markedRows()
+					if (rows.some((entry) => entry.path !== rows[0]!.path)) this.notice = "a range must stay within one file"
+					else if (rows.length > 0) this.startCompose(null)
+				} else if (row && (isLineRow(row) || row.kind === "file")) this.startCompose(null)
+				else if (row?.kind === "thread") this.startCompose(row.thread)
+				return
+			}
+			case "reply": {
+				const thread = this.currentThread()
+				if (thread) this.startCompose(thread)
+				return
+			}
+			case "toggleType": {
+				const thread = this.currentThread()
+				if (!thread) return
+				toggleKind(thread)
+				this.onChange()
+				return
+			}
+			case "resolve": {
+				const thread = this.currentThread()
+				if (!thread) return
+				const done = isQuestion(thread) ? "answered" : "resolved"
+				setStatus(thread, thread.status === done ? "open" : done)
+				this.onChange()
+				return
+			}
+			case "delete": {
+				const thread = this.currentThread()
+				if (!thread) return
+				removeThread(this.state, thread.id)
+				this.mark = null
+				this.rebuild()
+				this.clampCursor()
+				this.onChange(thread.id)
+				return
+			}
+			case "send": {
+				const threads = openThreads(this.state)
+				if (threads.length === 0) this.notice = "no open comments"
+				else this.onSend(threads)
+				return
+			}
+			case "split":
+				this.split = !this.split
+				if (this.split && this.width > 0 && this.width < MIN_SPLIT_WIDTH) {
+					this.notice = `split view needs ${MIN_SPLIT_WIDTH}+ columns`
+				}
+				this.rebuildKeepingPlace()
+				this.persistPrefs()
+				return
+			case "lineNumbers":
+				this.lineNumbers = !this.lineNumbers
+				this.persistPrefs()
+				return
+		}
+	}
+
+	// ── rendering ───────────────────────────────────────────────────
+
+	private kindColor(kind: ThreadKind): ThemeColor {
+		return kind === "question" ? "mdLink" : "warning"
 	}
 
 	private statusBadge(thread: Thread): string {
@@ -179,230 +461,42 @@ export class ReviewComponent implements Component, Focusable {
 		return this.theme.fg(color, label)
 	}
 
-	private startCompose(kind: "comment" | "reply", thread: Thread | null): void {
-		this.composeKind = kind
-		this.composeThread = thread
-		this.mode = "compose"
-		const input = new Input({
-			prompt: kind === "comment" ? "comment> " : "reply> ",
-			placeholder: kind === "comment" ? "what should the agent fix here?" : "add to the thread",
-		})
-		input.focused = this.isFocused
-		input.onSubmit = (value) => this.submitCompose(value)
-		input.onEscape = () => this.cancelCompose()
-		this.input = input
-		this.tui.requestRender()
+	private lineColor(line: DiffLine): ThemeColor {
+		return line.origin === "add" ? "toolDiffAdded" : line.origin === "del" ? "toolDiffRemoved" : "toolDiffContext"
 	}
 
-	private cancelCompose(): void {
-		this.mode = "browse"
-		this.input = null
-		this.tui.requestRender()
+	/** Number gutter (when enabled), sign and text for one side of a diff line. */
+	private lineCell(line: DiffLine | undefined, no: number | null | undefined, width: number): string {
+		const theme = this.theme
+		const gutter = this.lineNumbers ? `${theme.fg("dim", String(no ?? "").padStart(4))} ` : ""
+		if (!line) return truncateToWidth(gutter, width)
+		const sign = line.origin === "add" ? "+" : line.origin === "del" ? "-" : " "
+		const body = theme.fg(this.lineColor(line), `${sign} ${line.text.replace(/\t/g, "  ")}`)
+		return truncateToWidth(`${gutter}${body}`, width)
 	}
 
-	private submitCompose(value: string): void {
-		const text = value.trim()
-		if (!text) {
-			this.cancelCompose()
-			return
-		}
-
-		if (this.composeKind === "reply" && this.composeThread) {
-			replyToThread(this.composeThread, "user", text)
-		} else {
-			const row = this.currentRow()
-			const range = this.selectedRange()
-			if (range) {
-				addThread(this.state, { ...range, severity: "warning", text })
-			} else if (row?.kind === "line") {
-				const anchor = anchorLine(row.line)
-				addThread(this.state, {
-					path: row.path,
-					line: anchor.line,
-					side: anchor.side,
-					anchorText: row.line.text,
-					severity: "warning",
-					text,
-				})
-			} else if (row?.kind === "file") {
-				addThread(this.state, {
-					path: row.path,
-					line: 0,
-					side: "new",
-					anchorText: "",
-					severity: "warning",
-					text,
-				})
-			}
-		}
-
-		this.mode = "browse"
-		this.input = null
-		this.mark = null
-		this.rebuild()
-		this.clampCursor()
-		this.onChange()
-		this.tui.requestRender()
+	private pad(text: string, width: number): string {
+		return text + " ".repeat(Math.max(0, width - visibleWidth(text)))
 	}
 
-	/** Line rows between the mark and the cursor (inclusive), in display order. */
-	private markedRows(): Extract<Row, { kind: "line" }>[] {
-		if (this.mark === null) return []
-		const from = Math.min(this.mark, this.cursor)
-		const to = Math.max(this.mark, this.cursor)
-		return this.rows
-			.slice(from, to + 1)
-			.filter((row): row is Extract<Row, { kind: "line" }> => row.kind === "line")
-	}
-
-	/**
-	 * The range selection as a thread anchor. Ranges are numbered on the new side when
-	 * any selected line exists there; removed lines inside such a range are just context.
-	 */
-	private selectedRange():
-		| { path: string; line: number; endLine: number; side: "new" | "old"; anchorText: string }
-		| undefined {
-		const rows = this.markedRows()
-		if (rows.length < 2) return undefined
-		const path = rows[0]!.path
-		if (rows.some((row) => row.path !== path)) return undefined
-		const onNew = rows.filter((row) => row.line.newNo !== null)
-		const side: "new" | "old" = onNew.length > 0 ? "new" : "old"
-		const anchored = side === "new" ? onNew : rows
-		const numberOf = (row: Extract<Row, { kind: "line" }>) =>
-			(side === "new" ? row.line.newNo : row.line.oldNo) ?? 0
-		const first = anchored[0]!
-		return {
-			path,
-			line: numberOf(first),
-			endLine: numberOf(anchored[anchored.length - 1]!),
-			side,
-			anchorText: first.line.text,
-		}
-	}
-
-	handleInput(data: string): void {
-		if (this.mode === "compose") {
-			this.input?.handleInput(data)
-			this.tui.requestRender()
-			return
-		}
-
-		this.notice = ""
-
-		if (matchesKey(data, Key.escape) && this.mark !== null) {
-			this.mark = null
-			this.tui.requestRender()
-			return
-		}
-
-		if (matchesKey(data, Key.escape) || data === "q" || matchesKey(data, Key.ctrl("c"))) {
-			this.onClose()
-			return
-		}
-
-		if (matchesKey(data, Key.down) || data === "j") {
-			this.cursor = nextSelectable(this.rows, this.cursor, 1)
-		} else if (matchesKey(data, Key.up) || data === "k") {
-			this.cursor = nextSelectable(this.rows, this.cursor, -1)
-		} else if (data === "n") {
-			this.cursor = nextHunk(this.rows, this.cursor, 1)
-		} else if (data === "p") {
-			this.cursor = nextHunk(this.rows, this.cursor, -1)
-		} else if (data === "g") {
-			this.cursor = isSelectable(this.rows[0] ?? { kind: "spacer" })
-				? 0
-				: nextSelectable(this.rows, 0, 1)
-		} else if (data === "G") {
-			this.cursor = nextSelectable(this.rows, this.rows.length, -1)
-		} else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("d"))) {
-			for (let i = 0; i < this.viewportHeight(); i++) {
-				this.cursor = nextSelectable(this.rows, this.cursor, 1)
-			}
-		} else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("u"))) {
-			for (let i = 0; i < this.viewportHeight(); i++) {
-				this.cursor = nextSelectable(this.rows, this.cursor, -1)
-			}
-		} else if (matchesKey(data, Key.space)) {
-			const path = this.currentFilePath()
-			if (path) {
-				if (this.collapsed.has(path)) this.collapsed.delete(path)
-				else this.collapsed.add(path)
-				this.mark = null
-				this.rebuild()
-				this.clampCursor()
-			}
-		} else if (data === "v") {
-			const row = this.currentRow()
-			if (this.mark !== null) this.mark = null
-			else if (row?.kind === "line") this.mark = this.cursor
-			else this.notice = "start a range on a diff line"
-		} else if (data === "c") {
-			const row = this.currentRow()
-			if (this.mark !== null) {
-				const rows = this.markedRows()
-				if (rows.length > 0 && rows.some((entry) => entry.path !== rows[0]!.path)) {
-					this.notice = "a range must stay within one file"
-				} else if (rows.length > 0) {
-					this.startCompose("comment", null)
-				}
-			} else if (row?.kind === "line" || row?.kind === "file") this.startCompose("comment", null)
-			else if (row?.kind === "thread") this.startCompose("reply", row.thread)
-		} else if (data === "r") {
-			const thread = this.currentThread()
-			if (thread) this.startCompose("reply", thread)
-		} else if (data === "s") {
-			const thread = this.currentThread()
-			if (thread) {
-				cycleSeverity(thread)
-				this.onChange()
-			}
-		} else if (data === "x") {
-			const thread = this.currentThread()
-			if (thread) {
-				setStatus(thread, thread.status === "resolved" ? "open" : "resolved")
-				this.onChange()
-			}
-		} else if (data === "d") {
-			const thread = this.currentThread()
-			if (thread) {
-				removeThread(this.state, thread.id)
-				this.mark = null
-				this.rebuild()
-				this.clampCursor()
-				this.onChange(thread.id)
-			}
-		} else if (data === "f") {
-			const thread = this.currentThread()
-			if (thread) this.onFix([thread])
-			else this.notice = "no comment under cursor"
-		} else if (data === "F") {
-			const threads = openThreads(this.state)
-			if (threads.length === 0) this.notice = "no open comments"
-			else this.onFix(threads)
-		}
-
-		this.ensureVisible()
-		this.tui.requestRender()
-	}
-
-	private inMarkedRange(index: number): boolean {
-		if (this.mark === null) return false
-		return index >= Math.min(this.mark, this.cursor) && index <= Math.max(this.mark, this.cursor)
-	}
-
-	private renderRow(row: Row, width: number, selected: boolean, marked = false): string[] {
+	private renderRow(row: Row, width: number, selected: boolean, marked: boolean): string[] {
 		const theme = this.theme
 		const marker = selected ? theme.fg("accent", "▌") : marked ? theme.fg("warning", "┃") : " "
 
 		if (row.kind === "spacer") return [""]
 
 		if (row.kind === "file") {
-			const arrow = this.collapsed.has(row.path) ? "▸" : "▾"
+			const arrow = row.view === "viewed" ? "▸" : "▾"
 			const stats = `${theme.fg("toolDiffAdded", `+${row.added}`)} ${theme.fg("toolDiffRemoved", `-${row.removed}`)}`
 			const comments = row.threads > 0 ? theme.fg("warning", ` ${row.threads}◆`) : ""
+			const view =
+				row.view === "viewed"
+					? theme.fg("success", "  ✓ viewed")
+					: row.view === "changed"
+						? theme.fg("warning", "  ● changed since viewed")
+						: ""
 			const label = theme.bold(theme.fg("toolTitle", row.path))
-			return [truncateToWidth(`${marker}${arrow} ${label} ${stats}${comments}`, width)]
+			return [truncateToWidth(`${marker}${arrow} ${label} ${stats}${comments}${view}`, width)]
 		}
 
 		if (row.kind === "hunk") {
@@ -412,43 +506,48 @@ export class ReviewComponent implements Component, Focusable {
 		if (row.kind === "line") {
 			const line = row.line
 			const no = line.origin === "del" ? line.oldNo : line.newNo
-			const gutter = theme.fg("dim", String(no ?? "").padStart(5))
-			const sign = line.origin === "add" ? "+" : line.origin === "del" ? "-" : " "
-			const color =
-				line.origin === "add"
-					? "toolDiffAdded"
-					: line.origin === "del"
-						? "toolDiffRemoved"
-						: "toolDiffContext"
-			const body = theme.fg(color, `${sign} ${line.text.replace(/\t/g, "  ")}`)
-			return [truncateToWidth(`${marker}${gutter} ${body}`, width)]
+			return [truncateToWidth(`${marker}${this.lineCell(line, no, width - 1)}`, width)]
+		}
+
+		if (row.kind === "pair") {
+			const half = Math.floor((width - 2) / 2)
+			const left = this.pad(this.lineCell(row.left, row.left?.oldNo, half), half)
+			const right = ` ${this.lineCell(row.right, row.right?.newNo, width - half - 3)}`
+			const leftMark = selected && this.column === "left" ? theme.fg("accent", "▌") : marked ? theme.fg("warning", "┃") : " "
+			const divider = selected && this.column === "right" ? theme.fg("accent", "▌") : theme.fg("borderMuted", "│")
+			return [truncateToWidth(`${leftMark}${left}${divider}${right}`, width)]
 		}
 
 		const thread = row.thread
 		const message = thread.messages[row.messageIndex]!
 		const isFirst = row.messageIndex === 0
-		const bar = theme.fg(this.severityColor(thread.severity), "┃")
-		const prefix = `${marker}      ${bar} `
-		const available = Math.max(10, width - visibleWidth(prefix))
+		const bar = theme.fg(this.kindColor(thread.kind), "┃")
+		const indent = this.builtSplit && thread.side === "new" ? " ".repeat(Math.floor((width - 2) / 2) + 2) : "      "
+		const prefix = `${marker}${indent}${bar} `
 
 		const head = isFirst
-			? `${theme.fg(this.severityColor(thread.severity), SEVERITY_LABEL[thread.severity])} ${this.statusBadge(thread)} ${theme.fg("dim", threadLocation(thread))}`
+			? `${theme.fg(this.kindColor(thread.kind), KIND_LABEL[thread.kind])} ${this.statusBadge(thread)} ${theme.fg("dim", threadLocation(thread))}`
 			: theme.fg("dim", message.role === "user" ? "reviewer" : "agent")
 
 		const lines = [truncateToWidth(`${prefix}${head}`, width)]
-		const text = message.text.split("\n")
-		for (const part of text) {
-			lines.push(
-				truncateToWidth(
-					`${prefix}${theme.fg(message.role === "agent" ? "muted" : "text", part)}`,
-					width,
-				),
-			)
+		for (const part of message.text.split("\n")) {
+			lines.push(truncateToWidth(`${prefix}${theme.fg(message.role === "agent" ? "muted" : "text", part)}`, width))
 		}
 		return lines
 	}
 
+	private helpText(): string {
+		const k = (action: Action) => keyLabel(this.keys, action)
+		if (this.mark !== null) {
+			return ` range: move to extend · ${k("comment")} comment on ${this.markedRows().length} line(s) · ${k("range")}/esc cancel`
+		}
+		const columns = this.builtSplit ? ` · ${k("left")}/${k("right")} side` : ""
+		return ` ${k("down")}/${k("up")} move · ${k("nextHunk")}/${k("prevHunk")} hunk${columns} · ${k("comment")} comment · ${k("range")} range · ${k("reply")} reply · ${k("toggleType")} fix/question · ${k("resolve")} done · ${k("delete")} del · ${k("viewed")} viewed · ${k("split")} split · ${k("lineNumbers")} line #s · ${k("send")} ${this.sendLabel} all · ${k("quit")} quit`
+	}
+
 	render(width: number): string[] {
+		this.width = width
+		if (this.wantsSplit() !== this.builtSplit) this.rebuildKeepingPlace()
 		this.ensureVisible()
 		const theme = this.theme
 		const lines: string[] = []
@@ -461,12 +560,13 @@ export class ReviewComponent implements Component, Focusable {
 			{} as Record<string, number>,
 		)
 		const questions = this.state.threads.filter(isQuestion).length
+		const viewed = this.rows.filter((row) => row.kind === "file" && row.view === "viewed").length
 
 		const title = theme.bold(theme.fg("accent", " llm-review "))
 		const done = (counts.resolved ?? 0) + (counts.answered ?? 0)
 		const summary = theme.fg(
 			"muted",
-			`${this.state.branch} ← ${this.state.baseRef} · ${this.files.length} files · ${counts.open ?? 0} open · ${questions} question(s) · ${done} done`,
+			`${this.state.branch} ← ${this.state.baseRef} · ${viewed}/${this.files.length} viewed · ${counts.open ?? 0} open · ${questions} question(s) · ${done} done`,
 		)
 		lines.push(truncateToWidth(`${title}${summary}`, width))
 		lines.push(theme.fg("borderMuted", "─".repeat(Math.max(0, width))))
@@ -476,8 +576,7 @@ export class ReviewComponent implements Component, Focusable {
 		let index = this.scrollTop
 		while (rendered < height && index < this.rows.length) {
 			const row = this.rows[index]!
-			const rowLines = this.renderRow(row, width, index === this.cursor, this.inMarkedRange(index))
-			for (const line of rowLines) {
+			for (const line of this.renderRow(row, width, index === this.cursor, this.inMarkedRange(index))) {
 				if (rendered >= height) break
 				lines.push(line)
 				rendered++
@@ -492,19 +591,20 @@ export class ReviewComponent implements Component, Focusable {
 		lines.push(theme.fg("borderMuted", "─".repeat(Math.max(0, width))))
 
 		if (this.mode === "compose" && this.input) {
+			const kind = theme.bold(theme.fg(this.kindColor(this.composeKind), KIND_LABEL[this.composeKind]))
+			const what = this.composeThread ? "reply" : "comment"
+			lines.push(
+				truncateToWidth(
+					` ${kind} ${theme.fg("dim", `${what} · ${keyLabel(this.keys, "toggleType")} switch to ${this.composeKind === "fix" ? "question" : "fix"} · enter submit · esc cancel`)}`,
+					width,
+				),
+			)
 			for (const line of this.input.render(width)) lines.push(line)
-			lines.push(truncateToWidth(theme.fg("dim", " enter submit · esc cancel"), width))
-			this.logGeometry(width, lines.length)
 			return lines
 		}
 
-		const help =
-			this.mark !== null
-				? ` range: move to extend · c comment on ${this.markedRows().length} line(s) · v/esc cancel`
-				: ` j/k move · n/p hunk · space fold · v range · c comment · r reply · s sev/question · x done · d del · f ${this.sendLabel} · F ${this.sendLabel} all · q quit`
-		lines.push(truncateToWidth(theme.fg("dim", help), width))
+		lines.push(truncateToWidth(theme.fg("dim", this.helpText()), width))
 		if (this.notice) lines.push(truncateToWidth(theme.fg("warning", ` ${this.notice}`), width))
-		this.logGeometry(width, lines.length)
 		return lines
 	}
 

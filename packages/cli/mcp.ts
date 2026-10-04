@@ -63,7 +63,6 @@ async function callTool(exec: Exec, name: string, args: Json): Promise<string> {
 					.map((thread) => ({
 						threadId: thread.id,
 						location: threadLocation(thread),
-						severity: thread.severity,
 						kind: thread.kind,
 						comment: thread.messages.find((message) => message.role === "user")?.text ?? "",
 					})),

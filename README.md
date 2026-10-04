@@ -36,24 +36,43 @@ Comments live in the same per-branch file regardless of scope, so a comment left
 | `n` / `p` | Next / previous hunk |
 | `g` / `G` | Jump to top / bottom |
 | `ctrl+d` / `ctrl+u` | Page down / up |
-| `space` | Fold / unfold the current file |
-| `v` | Start / cancel a range selection (then move and press `c`) |
+| `h` / `l` | Split view: comment on the left (old) or right (new) side |
 | `c` | Comment on the current line, or on the selected range |
-| `r` | Reply to the comment thread under the cursor |
-| `s` | Cycle severity (critical → warning → suggestion → question) |
-| `x` | Toggle resolved |
+| `v` | Start / cancel a range selection (then move and press `c`) |
+| `tab` | Switch between fix and question (while typing a comment, or on a thread) |
+| `r` | Reply to the thread under the cursor |
+| `x` | Toggle done |
 | `d` | Delete the thread |
-| `f` | Send the thread under the cursor to the agent |
-| `F` | Send all open threads to the agent |
+| `space` | Mark the file viewed (collapses it) / unviewed |
+| `\` | Toggle side-by-side view (remembered; needs 100+ columns) |
+| `#` | Toggle line numbers (remembered) |
+| `F` | Send all open comments |
 | `q` / `esc` | Close |
 
-## Questions vs. fixes
+Every key can be rebound; see [Configuration](#configuration).
 
-Cycle a thread's severity to `question` with `s` and it becomes a question instead of a change request.
+Viewed files are saved per branch along with a hash of their diff. If the agent changes a viewed file, it reopens with a "changed since viewed" badge.
 
-On dispatch the prompt is split into two sections: **Fix these** (change the code) and **Answer these** ("these are questions, not change requests — do NOT modify any files"). Question threads move `open → asking → answered`; fix threads move `open → fixing → resolved`.
+## Fixes vs. questions
 
-The agent is asked to reply with one numbered section per comment, and each section is routed back to the thread it belongs to, so every comment gets its own answer rather than a copy of the whole response.
+Every comment is a **fix** (change the code) or a **question** (answer only). Press `tab` while typing to switch. On send, the prompt is split into **Fix these** and **Answer these**. Questions are explicitly "do NOT modify any files". Fix threads move `open → fixing → resolved`; questions move `open → asking → answered`.
+
+## Configuration
+
+Everything lives in `~/.config/llm-review/` (or `$LLM_REVIEW_CONFIG_DIR`):
+
+```jsonc
+// config.json
+{
+  "theme": "terminal",            // default: your terminal's palette, or a base16 scheme file, e.g. "tomorrow-night.yaml"
+  "keys": { "send": "ctrl+s", "down": ["j", "down"] },
+  "context": 3                     // diff lines shown around each comment in the prompt
+}
+```
+
+- **Themes:** any base16 scheme works as-is, including the hundreds in [tinted-theming/schemes](https://github.com/tinted-theming/schemes). Drop the `.yaml` file next to `config.json` and name it in `"theme"`.
+- **Keys:** the actions are `down up left right nextHunk prevHunk top bottom pageDown pageUp viewed range comment reply toggleType resolve delete send split lineNumbers quit`. Key ids look like `j`, `G`, `ctrl+d`, `tab`, `shift+tab`, `space` or `pageDown`.
+- **Prompt text:** `header.md` replaces the opening line and `footer.md` replaces the closing guidelines. Both can use `{count}`, `{fixes}`, `{questions}`, `{base}` and `{branch}`. The "how to respond" instructions between them are always included, because replies depend on them.
 
 ## How it works
 

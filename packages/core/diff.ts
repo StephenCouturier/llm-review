@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+
 export type LineOrigin = "context" | "add" | "del"
 
 export interface DiffLine {
@@ -107,4 +109,14 @@ export function findLineText(
 		}
 	}
 	return undefined
+}
+
+/** Stable fingerprint of a file's diff, used to notice when a "viewed" file changed. */
+export function fileDiffHash(file: FileDiff): string {
+	const hash = createHash("sha1")
+	hash.update(`${file.oldPath ?? ""}\0${file.path}\0${file.binary}\0`)
+	for (const hunk of file.hunks) {
+		for (const line of hunk.lines) hash.update(`${line.origin[0]}${line.text}\n`)
+	}
+	return hash.digest("hex").slice(0, 16)
 }
