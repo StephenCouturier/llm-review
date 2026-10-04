@@ -1,7 +1,7 @@
 import type { DiffLine, FileDiff } from "../core/diff.ts"
 import { anchorLine, countChanges } from "../core/diff.ts"
 import type { ReviewState, Thread } from "../core/threads.ts"
-import { threadsAtLine, threadsForFile } from "../core/threads.ts"
+import { threadsEndingAt, threadsForFile } from "../core/threads.ts"
 
 export type Row =
 	| { kind: "file"; path: string; file: FileDiff; added: number; removed: number; threads: number }
@@ -44,7 +44,7 @@ export function buildRows(
 			for (const line of hunk.lines) {
 				rows.push({ kind: "line", path: file.path, line })
 				const anchor = anchorLine(line)
-				const inline = threadsAtLine(state, file.path, anchor.line, anchor.side).filter(
+				const inline = threadsEndingAt(state, file.path, anchor.line, anchor.side).filter(
 					(thread) => thread.status !== "orphaned",
 				)
 				for (const thread of inline) {

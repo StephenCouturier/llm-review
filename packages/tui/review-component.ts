@@ -1,4 +1,3 @@
-import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent"
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui"
 import { Input, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui"
 import type { FileDiff } from "../core/diff.ts"
@@ -13,19 +12,25 @@ import {
 	replyToThread,
 	SEVERITY_LABEL,
 	setStatus,
+	threadLocation,
 } from "../core/threads.ts"
+import type { ReviewTheme, ThemeColor } from "./theme.ts"
 import type { Row } from "./rows.ts"
 import { buildRows, isSelectable, nextHunk, nextSelectable } from "./rows.ts"
 import { debugLog } from "./debug.ts"
 
 export interface ReviewComponentOptions {
 	tui: TUI
-	theme: Theme
+	theme: ReviewTheme
 	files: FileDiff[]
 	state: ReviewState
 	onChange: (deletedId?: string) => void
 	onFix: (threads: Thread[]) => void
 	onClose: () => void
+	/** Help-bar label for f/F, e.g. "send" inside an agent, "emit" for the standalone CLI. */
+	sendLabel?: string
+	/** Rows reserved for header/footer; the overlay inside pi needs more than a full-screen app. */
+	chromeRows?: number
 }
 
 type Mode = "browse" | "compose"
@@ -46,12 +51,14 @@ export class ReviewComponent implements Component, Focusable {
 	}
 
 	private readonly tui: TUI
-	private readonly theme: Theme
+	private readonly theme: ReviewTheme
 	private files: FileDiff[]
 	private readonly state: ReviewState
 	private readonly onChange: (deletedId?: string) => void
 	private readonly onFix: (threads: Thread[]) => void
 	private readonly onClose: () => void
+	private readonly sendLabel: string
+	private readonly chromeRows: number
 
 	private collapsed = new Set<string>()
 	private rows: Row[] = []
@@ -62,6 +69,8 @@ export class ReviewComponent implements Component, Focusable {
 	private composeKind: "comment" | "reply" = "comment"
 	private composeThread: Thread | null = null
 	private notice = ""
+	/** Row index where a range selection started (`v`), or null. */
+	private mark: number | null = null
 
 	constructor(options: ReviewComponentOptions) {
 		this.tui = options.tui
@@ -71,6 +80,8 @@ export class ReviewComponent implements Component, Focusable {
 		this.onChange = options.onChange
 		this.onFix = options.onFix
 		this.onClose = options.onClose
+		this.sendLabel = options.sendLabel ?? "send"
+		this.chromeRows = options.chromeRows ?? CHROME_ROWS
 		this.rebuild()
 		this.cursor = isSelectable(this.rows[0] ?? { kind: "spacer" })
 			? 0
@@ -103,7 +114,7 @@ export class ReviewComponent implements Component, Focusable {
 
 	private viewportHeight(): number {
 		const rows = this.tui.terminal.rows || 24
-		return Math.max(MIN_VIEWPORT, rows - CHROME_ROWS)
+		return Math.max(MIN_VIEWPORT, rows - this.chromeRows)
 	}
 
 	private logGeometry(width: number, produced: number): void {
@@ -160,6 +171,9 @@ export class ReviewComponent implements Component, Focusable {
 			orphaned: ["moved", "error"],
 			asking: ["asking", "accent"],
 			answered: ["answered", "success"],
+			wontfix: ["won't fix", "muted"],
+			needs_info: ["needs info", "warning"],
+			needs_review: ["check", "warning"],
 		}
 		const [label, color] = map[thread.status] ?? ["open", "warning"]
 		return this.theme.fg(color, label)
@@ -197,7 +211,10 @@ export class ReviewComponent implements Component, Focusable {
 			replyToThread(this.composeThread, "user", text)
 		} else {
 			const row = this.currentRow()
-			if (row?.kind === "line") {
+			const range = this.selectedRange()
+			if (range) {
+				addThread(this.state, { ...range, severity: "warning", text })
+			} else if (row?.kind === "line") {
 				const anchor = anchorLine(row.line)
 				addThread(this.state, {
 					path: row.path,
@@ -221,10 +238,47 @@ export class ReviewComponent implements Component, Focusable {
 
 		this.mode = "browse"
 		this.input = null
+		this.mark = null
 		this.rebuild()
 		this.clampCursor()
 		this.onChange()
 		this.tui.requestRender()
+	}
+
+	/** Line rows between the mark and the cursor (inclusive), in display order. */
+	private markedRows(): Extract<Row, { kind: "line" }>[] {
+		if (this.mark === null) return []
+		const from = Math.min(this.mark, this.cursor)
+		const to = Math.max(this.mark, this.cursor)
+		return this.rows
+			.slice(from, to + 1)
+			.filter((row): row is Extract<Row, { kind: "line" }> => row.kind === "line")
+	}
+
+	/**
+	 * The range selection as a thread anchor. Ranges are numbered on the new side when
+	 * any selected line exists there; removed lines inside such a range are just context.
+	 */
+	private selectedRange():
+		| { path: string; line: number; endLine: number; side: "new" | "old"; anchorText: string }
+		| undefined {
+		const rows = this.markedRows()
+		if (rows.length < 2) return undefined
+		const path = rows[0]!.path
+		if (rows.some((row) => row.path !== path)) return undefined
+		const onNew = rows.filter((row) => row.line.newNo !== null)
+		const side: "new" | "old" = onNew.length > 0 ? "new" : "old"
+		const anchored = side === "new" ? onNew : rows
+		const numberOf = (row: Extract<Row, { kind: "line" }>) =>
+			(side === "new" ? row.line.newNo : row.line.oldNo) ?? 0
+		const first = anchored[0]!
+		return {
+			path,
+			line: numberOf(first),
+			endLine: numberOf(anchored[anchored.length - 1]!),
+			side,
+			anchorText: first.line.text,
+		}
 	}
 
 	handleInput(data: string): void {
@@ -236,7 +290,13 @@ export class ReviewComponent implements Component, Focusable {
 
 		this.notice = ""
 
-		if (matchesKey(data, Key.escape) || data === "q") {
+		if (matchesKey(data, Key.escape) && this.mark !== null) {
+			this.mark = null
+			this.tui.requestRender()
+			return
+		}
+
+		if (matchesKey(data, Key.escape) || data === "q" || matchesKey(data, Key.ctrl("c"))) {
 			this.onClose()
 			return
 		}
@@ -268,12 +328,25 @@ export class ReviewComponent implements Component, Focusable {
 			if (path) {
 				if (this.collapsed.has(path)) this.collapsed.delete(path)
 				else this.collapsed.add(path)
+				this.mark = null
 				this.rebuild()
 				this.clampCursor()
 			}
+		} else if (data === "v") {
+			const row = this.currentRow()
+			if (this.mark !== null) this.mark = null
+			else if (row?.kind === "line") this.mark = this.cursor
+			else this.notice = "start a range on a diff line"
 		} else if (data === "c") {
 			const row = this.currentRow()
-			if (row?.kind === "line" || row?.kind === "file") this.startCompose("comment", null)
+			if (this.mark !== null) {
+				const rows = this.markedRows()
+				if (rows.length > 0 && rows.some((entry) => entry.path !== rows[0]!.path)) {
+					this.notice = "a range must stay within one file"
+				} else if (rows.length > 0) {
+					this.startCompose("comment", null)
+				}
+			} else if (row?.kind === "line" || row?.kind === "file") this.startCompose("comment", null)
 			else if (row?.kind === "thread") this.startCompose("reply", row.thread)
 		} else if (data === "r") {
 			const thread = this.currentThread()
@@ -294,6 +367,7 @@ export class ReviewComponent implements Component, Focusable {
 			const thread = this.currentThread()
 			if (thread) {
 				removeThread(this.state, thread.id)
+				this.mark = null
 				this.rebuild()
 				this.clampCursor()
 				this.onChange(thread.id)
@@ -312,9 +386,14 @@ export class ReviewComponent implements Component, Focusable {
 		this.tui.requestRender()
 	}
 
-	private renderRow(row: Row, width: number, selected: boolean): string[] {
+	private inMarkedRange(index: number): boolean {
+		if (this.mark === null) return false
+		return index >= Math.min(this.mark, this.cursor) && index <= Math.max(this.mark, this.cursor)
+	}
+
+	private renderRow(row: Row, width: number, selected: boolean, marked = false): string[] {
 		const theme = this.theme
-		const marker = selected ? theme.fg("accent", "▌") : " "
+		const marker = selected ? theme.fg("accent", "▌") : marked ? theme.fg("warning", "┃") : " "
 
 		if (row.kind === "spacer") return [""]
 
@@ -353,7 +432,7 @@ export class ReviewComponent implements Component, Focusable {
 		const available = Math.max(10, width - visibleWidth(prefix))
 
 		const head = isFirst
-			? `${theme.fg(this.severityColor(thread.severity), SEVERITY_LABEL[thread.severity])} ${this.statusBadge(thread)} ${theme.fg("dim", `${thread.path}:${thread.line}`)}`
+			? `${theme.fg(this.severityColor(thread.severity), SEVERITY_LABEL[thread.severity])} ${this.statusBadge(thread)} ${theme.fg("dim", threadLocation(thread))}`
 			: theme.fg("dim", message.role === "user" ? "reviewer" : "agent")
 
 		const lines = [truncateToWidth(`${prefix}${head}`, width)]
@@ -397,7 +476,7 @@ export class ReviewComponent implements Component, Focusable {
 		let index = this.scrollTop
 		while (rendered < height && index < this.rows.length) {
 			const row = this.rows[index]!
-			const rowLines = this.renderRow(row, width, index === this.cursor)
+			const rowLines = this.renderRow(row, width, index === this.cursor, this.inMarkedRange(index))
 			for (const line of rowLines) {
 				if (rendered >= height) break
 				lines.push(line)
@@ -420,7 +499,9 @@ export class ReviewComponent implements Component, Focusable {
 		}
 
 		const help =
-			" j/k move · n/p hunk · space fold · c comment · r reply · s sev/question · x done · d del · f send · F send all · q quit"
+			this.mark !== null
+				? ` range: move to extend · c comment on ${this.markedRows().length} line(s) · v/esc cancel`
+				: ` j/k move · n/p hunk · space fold · v range · c comment · r reply · s sev/question · x done · d del · f ${this.sendLabel} · F ${this.sendLabel} all · q quit`
 		lines.push(truncateToWidth(theme.fg("dim", help), width))
 		if (this.notice) lines.push(truncateToWidth(theme.fg("warning", ` ${this.notice}`), width))
 		this.logGeometry(width, lines.length)

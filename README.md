@@ -37,7 +37,8 @@ Comments live in the same per-branch file regardless of scope, so a comment left
 | `g` / `G` | Jump to top / bottom |
 | `ctrl+d` / `ctrl+u` | Page down / up |
 | `space` | Fold / unfold the current file |
-| `c` | Comment on the current line |
+| `v` | Start / cancel a range selection (then move and press `c`) |
+| `c` | Comment on the current line, or on the selected range |
 | `r` | Reply to the comment thread under the cursor |
 | `s` | Cycle severity (critical → warning → suggestion → question) |
 | `x` | Toggle resolved |
@@ -62,17 +63,62 @@ When you dispatch, the extension builds a prompt in `CRITICAL` / `WARNING` / `SU
 
 The review UI closes while the agent works, so you can watch the transcript. Reopen with `/llm-review` to see the result: threads are re-anchored onto the new line numbers by matching their source line, and any thread whose anchor disappeared is flagged `moved` rather than silently dropped.
 
+## Standalone (any agent)
+
+The same review UI runs outside pi as a filter, like `fzf`. It draws on `/dev/tty`, and when you press `f`/`F` it writes the review to stdout as markdown, with the diff around each comment and its line numbers. Pipe that into whatever agent you use:
+
+```sh
+npm install                                   # once, for the TUI dependency (Node >= 23.6)
+alias llm-review='node /path/to/llm-review/packages/cli/llm-review.ts'
+
+llm-review | claude -p                        # review, then hand it to a headless agent
+llm-review | codex exec -
+llm-review --copy                             # to the clipboard, to paste into a running agent
+llm-review --out review.md                    # or a file
+llm-review --local                            # only uncommitted changes; --base <ref> for an explicit base
+```
+
+Quitting with `q` prints nothing and exits 130, so nothing downstream runs.
+
+By default the markdown tells the agent to report back per thread with the CLI, so replies land on your threads whatever agent you use:
+
+```sh
+llm-review reply <threadId> --status resolved|answered|wontfix|needs_info -m "what changed"
+```
+
+Other commands:
+
+```sh
+llm-review pending                            # sent, not yet replied
+llm-review history                            # every batch you've sent, with its replies
+llm-review show <batchId>                     # the exact markdown that was sent
+llm-review settle <batchId> < answer.md       # route an agent's "### N." sections back onto threads
+llm-review dispatch                           # non-interactive: send all open threads
+llm-review mcp                                # MCP server on stdio
+```
+
+The MCP server exposes `review_list_pending`, `review_get` and `review_reply`, so an agent reports back per thread instead of having its final message parsed. For example, with Claude Code:
+
+```sh
+claude mcp add llm-review -- node /path/to/llm-review/packages/cli/llm-review.ts mcp
+```
+
+Agent replies may set `resolved`, `answered`, `wontfix` or `needs_info`. Threads still in flight when a batch settles without a reply are flagged `needs_review` (shown as `check`) instead of being marked done.
+
 ## State
 
 Reviews persist per repo and branch at:
 
 ```
-~/.pi/agent/llm-review/<repo>/<branch>.json
+~/.local/share/llm-review/<repo>/<branch>.json            threads (live state)
+~/.local/share/llm-review/<repo>/<branch>/batches/*.json  one file per dispatch: what was sent, how, and each reply
 ```
+
+Override the root with `LLM_REVIEW_HOME` (or `XDG_DATA_HOME`). Reviews saved by older versions under `~/.pi/agent/llm-review/` are picked up automatically by the pi extension.
 
 Nothing is written into the repository you're reviewing.
 
-Saves merge against what is already on disk, keyed by thread id, so two pi sessions reviewing the same branch cannot clobber each other's comments. A thread is only removed when you explicitly delete it with `d`.
+Saves merge against what is already on disk, keyed by thread id (newest `updatedAt` wins), so two sessions, the MCP server and the CLI can all write to the same branch without clobbering each other. A thread is only removed when you explicitly delete it with `d`.
 
 Set `LLM_REVIEW_DEBUG=1` to append render/geometry diagnostics to `/tmp/llm-review-debug.log` (override with `LLM_REVIEW_DEBUG_FILE`).
 

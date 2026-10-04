@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import type { FileDiff } from "./diff.ts"
 import { findLineText } from "./diff.ts"
@@ -9,8 +10,38 @@ function slugify(value: string): string {
 	return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unnamed"
 }
 
-export function statePath(baseDir: string, repoRoot: string, branch: string): string {
-	return join(baseDir, "llm-review", slugify(repoRoot), `${slugify(branch)}.json`)
+export function dataDir(): string {
+	if (process.env.LLM_REVIEW_HOME) return process.env.LLM_REVIEW_HOME
+	const xdg = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share")
+	return join(xdg, "llm-review")
+}
+
+export function statePath(repoRoot: string, branch: string, baseDir = dataDir()): string {
+	return join(baseDir, slugify(repoRoot), `${slugify(branch)}.json`)
+}
+
+export function batchDir(repoRoot: string, branch: string, baseDir = dataDir()): string {
+	return join(baseDir, slugify(repoRoot), slugify(branch), "batches")
+}
+
+/** Pre-standalone location, read once as a fallback so existing reviews carry over. */
+export function legacyStatePath(agentDir: string, repoRoot: string, branch: string): string {
+	return statePath(repoRoot, branch, join(agentDir, "llm-review"))
+}
+
+async function readJson<T>(file: string): Promise<T | null> {
+	try {
+		return JSON.parse(await readFile(file, "utf-8")) as T
+	} catch {
+		return null
+	}
+}
+
+export async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
+	await mkdir(dirname(file), { recursive: true })
+	const tmp = `${file}.${process.pid}.tmp`
+	await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf-8")
+	await rename(tmp, file)
 }
 
 export async function loadState(
@@ -18,27 +49,20 @@ export async function loadState(
 	repoRoot: string,
 	branch: string,
 	baseRef?: string,
+	legacyFile?: string,
 ): Promise<ReviewState> {
-	try {
-		const raw = await readFile(file, "utf-8")
-		const parsed = JSON.parse(raw) as ReviewState
-		if (parsed.version !== 1 || !Array.isArray(parsed.threads)) {
-			return createState(repoRoot, branch, baseRef ?? "HEAD")
-		}
-		if (baseRef) parsed.baseRef = baseRef
-		return parsed
-	} catch {
+	let parsed = await readJson<ReviewState>(file)
+	if (!parsed && legacyFile) parsed = await readJson<ReviewState>(legacyFile)
+	if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.threads)) {
 		return createState(repoRoot, branch, baseRef ?? "HEAD")
 	}
+	if (baseRef) parsed.baseRef = baseRef
+	return parsed
 }
 
 async function readThreadsOnDisk(file: string): Promise<Thread[]> {
-	try {
-		const parsed = JSON.parse(await readFile(file, "utf-8")) as ReviewState
-		return Array.isArray(parsed.threads) ? parsed.threads : []
-	} catch {
-		return []
-	}
+	const parsed = await readJson<ReviewState>(file)
+	return parsed && Array.isArray(parsed.threads) ? parsed.threads : []
 }
 
 export async function saveState(
@@ -56,16 +80,16 @@ export async function saveState(
 	}
 	for (const thread of state.threads) {
 		if (deleted.has(thread.id)) continue
+		// Another writer (MCP server, CLI, a second session) may have replied since we loaded.
+		const disk = merged.get(thread.id)
+		if (disk && disk.updatedAt > thread.updatedAt) continue
 		merged.set(thread.id, thread)
 	}
 
 	const threads = [...merged.values()].sort((a, b) => a.createdAt - b.createdAt)
 	state.threads = threads
 
-	await mkdir(dirname(file), { recursive: true })
-	const tmp = `${file}.${process.pid}.tmp`
-	await writeFile(tmp, `${JSON.stringify({ ...state, threads }, null, 2)}\n`, "utf-8")
-	await rename(tmp, file)
+	await writeJsonAtomic(file, { ...state, threads })
 }
 
 function reanchorThread(thread: Thread, file: FileDiff | undefined): void {
@@ -97,6 +121,7 @@ function reanchorThread(thread: Thread, file: FileDiff | undefined): void {
 	for (const candidate of candidates) {
 		if (Math.abs(candidate - thread.line) < Math.abs(best - thread.line)) best = candidate
 	}
+	if (thread.endLine !== undefined) thread.endLine += best - thread.line
 	thread.line = best
 	if (thread.status === "orphaned") thread.status = "open"
 }

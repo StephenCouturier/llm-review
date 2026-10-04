@@ -1,27 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-agent"
-import type { FileDiff } from "./core/diff.ts"
-import { parseUnifiedDiff } from "./core/diff.ts"
-import type { Exec, ReviewScope } from "./core/git.ts"
-import { getFileDiff, getRepoBasics, getRepoInfo, listChangedFiles } from "./core/git.ts"
-import { loadState, reanchorThreads, saveState, statePath } from "./core/store.ts"
-import type { ReviewState, Thread } from "./core/threads.ts"
-import {
-	buildDispatchPrompt,
-	dispatchStatus,
-	isQuestion,
-	parseAgentSections,
-	settledStatus,
-	setStatus,
-} from "./core/threads.ts"
-import { debugLog } from "./ui/debug.ts"
-import { ReviewComponent } from "./ui/review-component.ts"
-
-interface LoadedReview {
-	state: ReviewState
-	files: FileDiff[]
-	file: string
-}
+import type { Exec, ReviewScope } from "../../packages/core/git.ts"
+import type { LoadedReview } from "../../packages/core/review.ts"
+import { dispatchThreads, loadReview, settleBatch } from "../../packages/core/review.ts"
+import { saveState } from "../../packages/core/store.ts"
+import type { Thread } from "../../packages/core/threads.ts"
+import { isQuestion } from "../../packages/core/threads.ts"
+import { debugLog } from "../../packages/tui/debug.ts"
+import { ReviewComponent } from "../../packages/tui/review-component.ts"
 
 interface ParsedArgs {
 	scope: ReviewScope
@@ -44,7 +30,7 @@ function parseArgs(raw: string): ParsedArgs {
 }
 
 export default function (pi: ExtensionAPI) {
-	let pendingFix: string[] = []
+	let pendingBatch: string | undefined
 	let invocation = 0
 
 	const makeExec =
@@ -54,33 +40,10 @@ export default function (pi: ExtensionAPI) {
 			return { stdout: result.stdout, stderr: result.stderr, code: result.code }
 		}
 
-	async function load(
-		ctx: ExtensionContext,
-		args: ParsedArgs,
-		signal?: AbortSignal,
-	): Promise<LoadedReview> {
-		const exec = makeExec(ctx.cwd, signal)
-		const repo = await getRepoInfo(exec, { scope: args.scope, baseOverride: args.baseOverride })
-		const changed = await listChangedFiles(exec, repo.diffBase)
+	const host = () => ({ legacyAgentDir: getAgentDir() })
 
-		const files: FileDiff[] = []
-		for (const entry of changed) {
-			const raw = await getFileDiff(exec, repo.diffBase, entry)
-			const parsed = parseUnifiedDiff(raw, entry.path, entry.oldPath)
-			files.push(parsed)
-		}
-
-		const label = repo.scope === "local" ? "HEAD (local changes)" : repo.baseRef
-		const file = statePath(getAgentDir(), repo.root, repo.branch)
-		const state = await loadState(file, repo.root, repo.branch, label)
-		state.repo = repo.root
-		state.branch = repo.branch
-
-		const byPath = new Map(files.map((entry) => [entry.path, entry]))
-		reanchorThreads(state, byPath)
-		await saveState(file, state)
-
-		return { state, files, file }
+	function load(ctx: ExtensionContext, args: ParsedArgs, signal?: AbortSignal): Promise<LoadedReview> {
+		return loadReview(makeExec(ctx.cwd, signal), args, host())
 	}
 
 	function lastAssistantText(ctx: ExtensionContext): string | undefined {
@@ -195,14 +158,16 @@ export default function (pi: ExtensionAPI) {
 
 			if (dispatch.threads.length === 0) return
 
-			for (const thread of dispatch.threads) setStatus(thread, dispatchStatus(thread))
-			await saveState(loaded.file, loaded.state, deleted)
-
-			const prompt = buildDispatchPrompt(dispatch.threads, loaded.state.baseRef)
-			pendingFix = prompt.order
+			const { batch, prompt } = await dispatchThreads(makeExec(ctx.cwd), loaded, dispatch.threads, {
+				transport: "pi",
+				replyVia: "sections",
+				deleted,
+			})
+			pendingBatch = batch.id
 
 			const questions = dispatch.threads.filter(isQuestion).length
 			pi.appendEntry("llm-review-dispatch", {
+				batchId: batch.id,
 				count: dispatch.threads.length,
 				questions,
 				fixes: dispatch.threads.length - questions,
@@ -219,30 +184,15 @@ export default function (pi: ExtensionAPI) {
 	})
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		if (pendingFix.length === 0) return
-		const ids = pendingFix
-		pendingFix = []
+		if (!pendingBatch) return
+		const batchId = pendingBatch
+		pendingBatch = undefined
 
 		try {
-			const exec = makeExec(ctx.cwd)
-			const repo = await getRepoBasics(exec)
-			const file = statePath(getAgentDir(), repo.root, repo.branch)
-			const state = await loadState(file, repo.root, repo.branch)
-
-			const summary = lastAssistantText(ctx)
-			const sections = summary ? parseAgentSections(summary) : new Map<number, string>()
-
-			for (const thread of state.threads) {
-				const position = ids.indexOf(thread.id)
-				if (position < 0) continue
-				const reply = sections.get(position + 1) ?? (sections.size > 0 ? undefined : summary)
-				if (reply) thread.messages.push({ role: "agent", text: reply, ts: Date.now() })
-				setStatus(thread, settledStatus(thread))
-			}
-
-			await saveState(file, state)
-			const matched = sections.size > 0 ? ` (${sections.size} section(s) routed)` : ""
-			ctx.ui.notify(`llm-review: ${ids.length} comment(s) settled${matched}`, "info")
+			const settled = await settleBatch(makeExec(ctx.cwd), batchId, lastAssistantText(ctx), host())
+			if (!settled) return
+			const flagged = settled.unanswered > 0 ? `, ${settled.unanswered} need review` : ""
+			ctx.ui.notify(`llm-review: ${settled.batch.threadIds.length} comment(s) settled${flagged}`, "info")
 		} catch {
 			return
 		}

@@ -33,7 +33,8 @@ export function parseUnifiedDiff(raw: string, path: string, oldPath?: string): F
 	let oldNo = 0
 	let newNo = 0
 
-	for (const line of raw.split("\n")) {
+	// Drop the final newline so it doesn't parse as a phantom empty context line.
+	for (const line of raw.replace(/\n$/, "").split("\n")) {
 		if (line.startsWith("Binary files ") || line.startsWith("GIT binary patch")) {
 			file.binary = true
 			return file
