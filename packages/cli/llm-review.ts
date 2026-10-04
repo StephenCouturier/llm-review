@@ -9,6 +9,7 @@ import { dispatchThreads, loadBranchState, loadReview, pendingThreads, replyToTh
 import type { ReplyStatus } from "../core/threads.ts"
 import { openThreads, REPLY_STATUSES, threadLocation } from "../core/threads.ts"
 import { runMcpServer } from "./mcp.ts"
+import { popup } from "./popup.ts"
 
 const USAGE = `llm-review [review] [--local] [--base <ref>] [--reply cli|tool|sections] [--copy] [--out <file>]
                          open the review TUI; f/F writes the review as markdown to stdout
@@ -17,6 +18,8 @@ const USAGE = `llm-review [review] [--local] [--base <ref>] [--reply cli|tool|se
 
 llm-review <command>
 
+  popup [review options] open the TUI in a herdr pane / tmux popup / floating Hyprland terminal,
+                         wait for it, and print the review (for agents' slash commands)
   dispatch [--local] [--base <ref>] [--reply sections|tool|cli] [--compact]
                          send all open threads as a new batch; prints the prompt to stdout
   pending [--json]       threads sent to an agent that have no reply yet
@@ -213,6 +216,10 @@ async function main(argv: string[]): Promise<void> {
 			}
 			return
 		}
+
+		case "popup":
+			await popup(args)
+			return
 
 		case "mcp":
 			await runMcpServer(exec)
