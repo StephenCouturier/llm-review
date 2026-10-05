@@ -1,6 +1,6 @@
 ---
 description: Review your changes in llm-review, then have Claude address the comments
-argument-hint: "[--local] [--base <ref>]"
+argument-hint: "[--branch] [--base <ref>]"
 allowed-tools: Bash(llm-review popup:*), Bash(llm-review reply:*)
 ---
 !`llm-review popup $ARGUMENTS`

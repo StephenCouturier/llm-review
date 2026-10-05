@@ -39,13 +39,31 @@ export interface ReviewComponentOptions {
 	onPrefsChange?: (prefs: UiPrefs) => void
 }
 
-type Mode = "browse" | "compose"
+type Mode = "browse" | "compose" | "search"
 type Column = "left" | "right"
 
 const MIN_VIEWPORT = 8
 const CHROME_ROWS = 10
 /** Below this width split view falls back to unified. */
 const MIN_SPLIT_WIDTH = 100
+
+/** Vim smartcase: case-insensitive unless the query has a capital. Invalid regexes match literally. */
+function compileSearch(query: string): RegExp | null {
+	if (!query) return null
+	const flags = query === query.toLowerCase() ? "gi" : "g"
+	try {
+		return new RegExp(query, flags)
+	} catch {
+		return new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), flags)
+	}
+}
+
+function hasMatch(pattern: RegExp, text: string | undefined): boolean {
+	if (!text) return false
+	pattern.lastIndex = 0
+	for (const match of text.matchAll(pattern)) if (match[0].length > 0) return true
+	return false
+}
 
 export class ReviewComponent implements Component, Focusable {
 	private isFocused = false
@@ -81,6 +99,14 @@ export class ReviewComponent implements Component, Focusable {
 	private notice = ""
 	/** Row index where a range selection started, or null. */
 	private mark: number | null = null
+
+	/** Last search, kept for n/N; highlighting is cleared with esc but the query survives, like vim's :noh. */
+	private searchQuery = ""
+	private searchPattern: RegExp | null = null
+	private searchHighlight = false
+	private searchDirection: 1 | -1 = 1
+	/** Cursor/scroll/column when the search prompt opened, restored on esc. */
+	private searchOrigin: { cursor: number; scrollTop: number; column: Column } | null = null
 
 	private split: boolean
 	private lineNumbers: boolean
@@ -222,6 +248,132 @@ export class ReviewComponent implements Component, Focusable {
 		}
 	}
 
+	// ── search ──────────────────────────────────────────────────────
+
+	/** Which side of a row matches, or null. Split rows report the side so the cursor can follow it. */
+	private rowMatch(row: Row, pattern: RegExp): Column | "row" | null {
+		if (row.kind === "file") return hasMatch(pattern, row.path) ? "row" : null
+		if (row.kind === "line") return hasMatch(pattern, row.line.text) ? "row" : null
+		if (row.kind === "pair") {
+			const right = hasMatch(pattern, row.right?.text)
+			const left = row.left !== row.right && hasMatch(pattern, row.left?.text)
+			if (this.column === "left" && left) return "left"
+			return right ? "right" : left ? "left" : null
+		}
+		if (row.kind === "thread") return hasMatch(pattern, row.thread.messages[row.messageIndex]?.text) ? "row" : null
+		return null
+	}
+
+	private matchingRows(pattern: RegExp): number[] {
+		const indices: number[] = []
+		for (let index = 0; index < this.rows.length; index++) if (this.rowMatch(this.rows[index]!, pattern)) indices.push(index)
+		return indices
+	}
+
+	/**
+	 * Move to the next match strictly after (or before) `from`, wrapping around like vim.
+	 * `inclusive` also accepts `from` itself, for incremental search as the query is typed.
+	 */
+	private jumpToMatch(pattern: RegExp, from: number, direction: 1 | -1, inclusive = false): boolean {
+		const matches = this.matchingRows(pattern)
+		if (matches.length === 0) {
+			this.notice = `pattern not found: ${this.searchQuery}`
+			return false
+		}
+		const ahead = direction === 1
+			? matches.find((index) => (inclusive ? index >= from : index > from))
+			: matches.findLast((index) => (inclusive ? index <= from : index < from))
+		const target = ahead ?? (direction === 1 ? matches[0]! : matches[matches.length - 1]!)
+		const side = this.rowMatch(this.rows[target]!, pattern)
+		if (side === "left" || side === "right") this.column = side
+		this.cursor = target
+		const position = `${matches.indexOf(target) + 1}/${matches.length}`
+		const prefix = direction === 1 ? "/" : "?"
+		this.notice = ahead === undefined
+			? `search hit ${direction === 1 ? "BOTTOM, continuing at TOP" : "TOP, continuing at BOTTOM"} · [${position}]`
+			: `${prefix}${this.searchQuery} [${position}]`
+		return true
+	}
+
+	private startSearch(direction: 1 | -1): void {
+		this.searchDirection = direction
+		this.searchOrigin = { cursor: this.cursor, scrollTop: this.scrollTop, column: this.column }
+		this.mode = "search"
+		const input = new Input()
+		input.focused = this.isFocused
+		input.onSubmit = (value) => this.submitSearch(value)
+		input.onEscape = () => this.cancelSearch()
+		this.input = input
+	}
+
+	/** Incremental search: preview the first match from where the prompt opened. */
+	private previewSearch(): void {
+		const origin = this.searchOrigin
+		if (!origin || this.mode !== "search") return
+		const query = this.input?.getValue() ?? ""
+		this.cursor = origin.cursor
+		this.scrollTop = origin.scrollTop
+		this.column = origin.column
+		this.notice = ""
+		const pattern = compileSearch(query)
+		if (!pattern) return
+		const previous = this.searchQuery
+		this.searchQuery = query
+		if (!this.jumpToMatch(pattern, origin.cursor, this.searchDirection, true)) this.notice = ""
+		this.searchQuery = previous
+	}
+
+	private submitSearch(value: string): void {
+		const origin = this.searchOrigin
+		this.mode = "browse"
+		this.input = null
+		this.searchOrigin = null
+		// An empty query repeats the last search, as in vim.
+		const query = value || this.searchQuery
+		const pattern = compileSearch(query)
+		if (!pattern || !origin) {
+			this.tui.requestRender()
+			return
+		}
+		this.searchQuery = query
+		this.searchPattern = pattern
+		this.searchHighlight = true
+		this.cursor = origin.cursor
+		if (!this.jumpToMatch(pattern, origin.cursor, this.searchDirection)) this.cursor = origin.cursor
+		this.ensureVisible()
+		this.tui.requestRender()
+	}
+
+	private cancelSearch(): void {
+		const origin = this.searchOrigin
+		if (origin) {
+			this.cursor = origin.cursor
+			this.scrollTop = origin.scrollTop
+			this.column = origin.column
+		}
+		this.mode = "browse"
+		this.input = null
+		this.searchOrigin = null
+		this.notice = ""
+		this.tui.requestRender()
+	}
+
+	/** n repeats in the search's own direction, N reverses it. */
+	private repeatSearch(reverse: boolean): void {
+		if (!this.searchPattern) return
+		this.searchHighlight = true
+		const direction = (reverse ? -this.searchDirection : this.searchDirection) as 1 | -1
+		this.jumpToMatch(this.searchPattern, this.cursor, direction)
+	}
+
+	/** Reverse-video the search matches inside already-plain text. */
+	private highlight(text: string): string {
+		const pattern = this.searchHighlight ? this.searchPattern : null
+		if (!pattern) return text
+		pattern.lastIndex = 0
+		return text.replace(pattern, (match) => (match ? `\x1b[7m${match}\x1b[27m` : match))
+	}
+
 	// ── compose ─────────────────────────────────────────────────────
 
 	private startCompose(thread: Thread | null): void {
@@ -290,6 +442,14 @@ export class ReviewComponent implements Component, Focusable {
 	// ── input ───────────────────────────────────────────────────────
 
 	handleInput(data: string): void {
+		if (this.mode === "search") {
+			this.input?.handleInput(data)
+			this.previewSearch()
+			this.ensureVisible()
+			this.tui.requestRender()
+			return
+		}
+
 		if (this.mode === "compose") {
 			if (this.keys.toggleType.some((binding) => matchesBinding(data, binding))) {
 				this.composeKind = this.composeKind === "fix" ? "question" : "fix"
@@ -301,10 +461,14 @@ export class ReviewComponent implements Component, Focusable {
 		}
 
 		this.notice = ""
-		const action = actionFor(this.keys, data)
+		const searching = this.searchPattern !== null && this.mark === null
+		const bound = (name: Action) => this.keys[name].some((binding) => matchesBinding(data, binding))
+		const action = searching && bound("searchNext") ? "searchNext" : searching && bound("searchPrev") ? "searchPrev" : actionFor(this.keys, data)
 
-		if (action === "quit" && this.mark !== null && !matchesBinding(data, "q")) {
-			this.mark = null
+		if (action === "quit" && !matchesBinding(data, "q") && (this.mark !== null || this.searchHighlight)) {
+			// esc clears a range first, then search highlighting, and only then closes.
+			if (this.mark !== null) this.mark = null
+			else this.searchHighlight = false
 			this.tui.requestRender()
 			return
 		}
@@ -436,6 +600,15 @@ export class ReviewComponent implements Component, Focusable {
 				this.lineNumbers = !this.lineNumbers
 				this.persistPrefs()
 				return
+			case "search":
+			case "searchBack":
+				this.mark = null
+				this.startSearch(action === "search" ? 1 : -1)
+				return
+			case "searchNext":
+			case "searchPrev":
+				this.repeatSearch(action === "searchPrev")
+				return
 		}
 	}
 
@@ -471,7 +644,7 @@ export class ReviewComponent implements Component, Focusable {
 		const gutter = this.lineNumbers ? `${theme.fg("dim", String(no ?? "").padStart(4))} ` : ""
 		if (!line) return truncateToWidth(gutter, width)
 		const sign = line.origin === "add" ? "+" : line.origin === "del" ? "-" : " "
-		const body = theme.fg(this.lineColor(line), `${sign} ${line.text.replace(/\t/g, "  ")}`)
+		const body = theme.fg(this.lineColor(line), `${sign} ${this.highlight(line.text.replace(/\t/g, "  "))}`)
 		return truncateToWidth(`${gutter}${body}`, width)
 	}
 
@@ -495,7 +668,7 @@ export class ReviewComponent implements Component, Focusable {
 					: row.view === "changed"
 						? theme.fg("warning", "  ● changed since viewed")
 						: ""
-			const label = theme.bold(theme.fg("toolTitle", row.path))
+			const label = theme.bold(theme.fg("toolTitle", this.highlight(row.path)))
 			return [truncateToWidth(`${marker}${arrow} ${label} ${stats}${comments}${view}`, width)]
 		}
 
@@ -531,7 +704,7 @@ export class ReviewComponent implements Component, Focusable {
 
 		const lines = [truncateToWidth(`${prefix}${head}`, width)]
 		for (const part of message.text.split("\n")) {
-			lines.push(truncateToWidth(`${prefix}${theme.fg(message.role === "agent" ? "muted" : "text", part)}`, width))
+			lines.push(truncateToWidth(`${prefix}${theme.fg(message.role === "agent" ? "muted" : "text", this.highlight(part))}`, width))
 		}
 		return lines
 	}
@@ -542,7 +715,11 @@ export class ReviewComponent implements Component, Focusable {
 			return ` range: move to extend · ${k("comment")} comment on ${this.markedRows().length} line(s) · ${k("range")}/esc cancel`
 		}
 		const columns = this.builtSplit ? ` · ${k("left")}/${k("right")} side` : ""
-		return ` ${k("down")}/${k("up")} move · ${k("nextHunk")}/${k("prevHunk")} hunk${columns} · ${k("comment")} comment · ${k("range")} range · ${k("reply")} reply · ${k("toggleType")} fix/question · ${k("resolve")} done · ${k("delete")} del · ${k("viewed")} viewed · ${k("split")} split · ${k("lineNumbers")} line #s · ${k("send")} ${this.sendLabel} all · ${k("quit")} quit`
+		// With a search active, n/N belong to it, so show hunk keys that don't collide.
+		const free = (action: Action) => (this.searchPattern ? this.keys[action].find((key) => !this.keys.searchNext.includes(key) && !this.keys.searchPrev.includes(key)) : undefined) ?? k(action)
+		const match = this.searchPattern ? ` · ${k("searchNext")}/${k("searchPrev")} match` : ""
+		const hunks = `${free("nextHunk")}/${free("prevHunk")} hunk${match}`
+		return ` ${k("down")}/${k("up")} move · ${hunks}${columns} · ${k("search")} search · ${k("comment")} comment · ${k("range")} range · ${k("reply")} reply · ${k("toggleType")} fix/question · ${k("resolve")} done · ${k("delete")} del · ${k("viewed")} viewed · ${k("split")} split · ${k("lineNumbers")} line #s · ${k("send")} ${this.sendLabel} all · ${k("quit")} quit`
 	}
 
 	render(width: number): string[] {
@@ -589,6 +766,14 @@ export class ReviewComponent implements Component, Focusable {
 		}
 
 		lines.push(theme.fg("borderMuted", "─".repeat(Math.max(0, width))))
+
+		if (this.mode === "search" && this.input) {
+			const prompt = this.searchDirection === 1 ? "/" : "?"
+			lines.push(truncateToWidth(theme.fg("dim", ` search ${prompt} · regex, smartcase · enter jump · esc cancel`), width))
+			for (const line of this.input.render(width)) lines.push(line)
+			if (this.notice) lines.push(truncateToWidth(theme.fg("warning", ` ${this.notice}`), width))
+			return lines
+		}
 
 		if (this.mode === "compose" && this.input) {
 			const kind = theme.bold(theme.fg(this.kindColor(this.composeKind), KIND_LABEL[this.composeKind]))

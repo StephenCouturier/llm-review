@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process"
 import { readFileSync, writeFileSync } from "node:fs"
 import { listBatches, loadBatch } from "../core/batch.ts"
 import { nodeExec } from "../core/exec.ts"
+import type { ReviewScope } from "../core/git.ts"
 import type { ReplyVia } from "../core/render.ts"
 import { buildCompactPrompt, buildDispatchPrompt } from "../core/render.ts"
 import { dispatchThreads, loadBranchState, loadReview, pendingThreads, replyToThreadById, settleBatch } from "../core/review.ts"
@@ -11,8 +12,9 @@ import { openThreads, REPLY_STATUSES, threadLocation } from "../core/threads.ts"
 import { runMcpServer } from "./mcp.ts"
 import { popup } from "./popup.ts"
 
-const USAGE = `llm-review [review] [--local] [--base <ref>] [--reply cli|tool|sections] [--copy] [--out <file>]
-                         open the review TUI; f/F writes the review as markdown to stdout
+const USAGE = `llm-review [review] [--branch] [--base <ref>] [--reply cli|tool|sections] [--copy] [--out <file>]
+                         open the review TUI on uncommitted changes (--branch: the whole branch
+                         vs its base); f/F writes the review as markdown to stdout
                          (or the clipboard / a file), ready to hand to any agent:
                            llm-review | claude -p      llm-review --copy      llm-review > review.md
 
@@ -20,7 +22,7 @@ llm-review <command>
 
   popup [review options] open the TUI in a herdr pane / tmux popup / floating Hyprland terminal,
                          wait for it, and print the review (for agents' slash commands)
-  dispatch [--local] [--base <ref>] [--reply sections|tool|cli] [--compact]
+  dispatch [--branch] [--base <ref>] [--reply sections|tool|cli] [--compact]
                          send all open threads as a new batch; prints the prompt to stdout
   pending [--json]       threads sent to an agent that have no reply yet
   show <batchId> [--reply sections|tool|cli]
@@ -43,6 +45,11 @@ function flag(args: string[], ...names: string[]): string | undefined {
 
 function has(args: string[], ...names: string[]): boolean {
 	return names.some((name) => args.includes(name))
+}
+
+/** Uncommitted changes by default; --branch (or an explicit --base) reviews the whole branch. */
+function reviewScope(args: string[], base: string | undefined): ReviewScope {
+	return base || has(args, "--branch", "-b") ? "branch" : "local"
 }
 
 function readStdin(): string {
@@ -79,7 +86,7 @@ function copyToClipboard(text: string): boolean {
 async function review(args: string[]): Promise<void> {
 	const exec = nodeExec(process.cwd())
 	const base = flag(args, "--base")
-	const scope = has(args, "--local", "-l") && !base ? "local" : "branch"
+	const scope = reviewScope(args, base)
 	const loaded = await loadReview(exec, { scope, baseOverride: base })
 	if (loaded.files.length === 0) {
 		process.stderr.write(scope === "local" ? "no uncommitted changes\n" : `no changes against ${loaded.state.baseRef}\n`)
@@ -132,7 +139,7 @@ async function main(argv: string[]): Promise<void> {
 	switch (command) {
 		case "dispatch": {
 			const base = flag(args, "--base")
-			const loaded = await loadReview(exec, { scope: has(args, "--local", "-l") && !base ? "local" : "branch", baseOverride: base })
+			const loaded = await loadReview(exec, { scope: reviewScope(args, base), baseOverride: base })
 			const threads = openThreads(loaded.state)
 			if (threads.length === 0) {
 				process.stderr.write("no open threads\n")

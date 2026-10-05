@@ -18,7 +18,7 @@ interface ParsedArgs {
 
 function parseArgs(raw: string): ParsedArgs {
 	const tokens = raw.trim().split(/\s+/).filter(Boolean)
-	let scope: ReviewScope = "branch"
+	let scope: ReviewScope = "local"
 	let baseOverride: string | undefined
 
 	for (const token of tokens) {
@@ -73,11 +73,11 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("llm-review", {
-		description: "Review branch changes and send comments to the agent (--local for uncommitted only)",
+		description: "Review uncommitted changes and send comments to the agent (--branch for the whole branch)",
 		getArgumentCompletions: (prefix: string) => {
 			const items = [
-				{ value: "--local", label: "--local", description: "Only uncommitted changes (vs HEAD)" },
-				{ value: "--branch", label: "--branch", description: "Whole branch vs its base (default)" },
+				{ value: "--local", label: "--local", description: "Only uncommitted changes vs HEAD (default)" },
+				{ value: "--branch", label: "--branch", description: "Whole branch vs its base" },
 			]
 			const filtered = items.filter((item) => item.value.startsWith(prefix))
 			return filtered.length > 0 ? filtered : null

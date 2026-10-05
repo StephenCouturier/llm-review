@@ -149,7 +149,9 @@ export function nextHunk(rows: Row[], from: number, direction: 1 | -1): number {
 	while (index >= 0 && index < rows.length) {
 		const row = rows[index]!
 		if (row.kind === "hunk" || row.kind === "file") {
-			return nextSelectable(rows, index, 1)
+			const target = nextSelectable(rows, index, 1)
+			// Going back, the header of the hunk we're in leads to where we already are (or below); keep looking.
+			if (direction === 1 || target < from) return target
 		}
 		index += direction
 	}

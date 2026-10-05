@@ -19,21 +19,23 @@ pi -e git:github.com/StephenCouturier/llm-review
 ## Usage
 
 ```
-/llm-review              review the branch against its auto-detected base
-/llm-review --local      review only uncommitted changes (staged, unstaged, untracked)
-/llm-review origin/dev   review against an explicit base ref
+/llm-review              review only uncommitted changes (staged, unstaged, untracked)
+/llm-review --branch     review the whole branch against its auto-detected base
+/llm-review origin/dev   review the branch against an explicit base ref
 ```
 
-By default the diff covers everything on the branch: commits since the merge base, plus staged, unstaged, and untracked files. With `--local` (or `-l`) it covers only what you haven't committed yet, diffed against `HEAD`.
+By default the diff covers only what you haven't committed yet, diffed against `HEAD`. With `--branch` (or `-b`), or an explicit base ref, it covers everything on the branch: commits since the merge base, plus staged, unstaged, and untracked files.
 
-Comments live in the same per-branch file regardless of scope, so a comment left in `--local` is still there when you open the full branch review.
+Comments live in the same per-branch file regardless of scope, so a comment left on uncommitted changes is still there when you open the full branch review.
 
 ### Keys
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` / `↓` / `↑` | Move cursor |
-| `n` / `p` | Next / previous hunk |
+| `n` / `p` (or `]` / `[`) | Next / previous hunk |
+| `/` / `?` | Search forward / backward (regex, smartcase, jumps as you type) |
+| `n` / `N` | Next / previous match while a search is active (`esc` clears it, then `n` is next hunk again) |
 | `g` / `G` | Jump to top / bottom |
 | `ctrl+d` / `ctrl+u` | Page down / up |
 | `h` / `l` | Split view: comment on the left (old) or right (new) side |
@@ -71,7 +73,7 @@ Everything lives in `~/.config/llm-review/` (or `$LLM_REVIEW_CONFIG_DIR`):
 ```
 
 - **Themes:** any base16 scheme works as-is, including the hundreds in [tinted-theming/schemes](https://github.com/tinted-theming/schemes). Drop the `.yaml` file next to `config.json` and name it in `"theme"`.
-- **Keys:** the actions are `down up left right nextHunk prevHunk top bottom pageDown pageUp viewed range comment reply toggleType resolve delete send split lineNumbers quit`. Key ids look like `j`, `G`, `ctrl+d`, `tab`, `shift+tab`, `space` or `pageDown`.
+- **Keys:** the actions are `down up left right nextHunk prevHunk top bottom pageDown pageUp viewed range comment reply toggleType resolve delete send split lineNumbers search searchBack searchNext searchPrev quit`. Key ids look like `j`, `G`, `ctrl+d`, `tab`, `shift+tab`, `space` or `pageDown`.
 - **Prompt text:** `header.md` replaces the opening line and `footer.md` replaces the closing guidelines. Both can use `{count}`, `{fixes}`, `{questions}`, `{base}` and `{branch}`. The "how to respond" instructions between them are always included, because replies depend on them.
 
 ## How it works
@@ -94,7 +96,7 @@ llm-review | claude -p                        # review, then hand it to a headle
 llm-review | codex exec -
 llm-review --copy                             # to the clipboard, to paste into a running agent
 llm-review --out review.md                    # or a file
-llm-review --local                            # only uncommitted changes; --base <ref> for an explicit base
+llm-review --branch                           # the whole branch, not just uncommitted changes; --base <ref> for an explicit base
 ```
 
 Quitting with `q` prints nothing and exits 130, so nothing downstream runs.

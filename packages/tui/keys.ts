@@ -11,8 +11,8 @@ export const DEFAULT_KEYS = {
 	up: ["k", "up"],
 	left: ["h", "left"],
 	right: ["l", "right"],
-	nextHunk: ["n"],
-	prevHunk: ["p"],
+	nextHunk: ["n", "]"],
+	prevHunk: ["p", "["],
 	top: ["g", "home"],
 	bottom: ["G", "end"],
 	pageDown: ["ctrl+d", "pageDown"],
@@ -27,6 +27,11 @@ export const DEFAULT_KEYS = {
 	send: ["F"],
 	split: ["\\"],
 	lineNumbers: ["#"],
+	search: ["/"],
+	searchBack: ["?"],
+	/** While a search is active these win over any other action bound to the same key (n is also next hunk). */
+	searchNext: ["n"],
+	searchPrev: ["N"],
 	quit: ["q", "esc", "ctrl+c"],
 } satisfies Record<string, string[]>
 
