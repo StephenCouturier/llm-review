@@ -1,5 +1,9 @@
 # llm-review
 
+> [!IMPORTANT]
+> **llm-review is now [nit](https://github.com/StephenCouturier/nit).** This repository is archived and no longer maintained.
+> nit is the same tool under a new name: `/nit` in pi, `nit` on the command line. On first run it copies your existing reviews and config from the llm-review locations, so nothing is lost.
+
 A [pi](https://pi.dev) extension for reviewing your branch's changes in a TUI and handing the comments to the agent to fix.
 
 Run `/llm-review`, walk the diff, leave line-anchored comments, hit `F`. The agent gets your comments as a structured work list, fixes them in the same session with full context, and its reply is attached back onto each comment thread.
